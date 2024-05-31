@@ -6,22 +6,52 @@
 #define IPCACK_MAX_NAME 100
 
 typedef uint16_t IPCAckError;
+
+/// Error codes.
+typedef enum IPCAckErrorHigh {
+    IPCACK_ERR_H_OK = 0x0,
+    IPCACK_ERR_H_ARGS,
+    IPCACK_ERR_H_SYS,
+    IPCACK_ERR_H_IPC,
+
+    IPCACK_ERR_H_COUNT,
+} IPCAckErrorHigh;
+
+/// Error details.
+typedef enum IPCAckErrorLow {
+    IPCACK_ERR_L_NONE = 0x0,
+
+    IPCACK_ERR_L_NOT_INITIALIZED,
+    IPCACK_ERR_L_IS_NULL,
+    IPCACK_ERR_L_INDEX,
+    IPCACK_ERR_L_STRING_TOO_LONG,
+    IPCACK_ERR_L_STRING_TOO_SHORT,
+    IPCACK_ERR_L_STRING_INVALID,
+    IPCACK_ERR_L_STRING_UTF8_INVALID,
+
+    IPCACK_ERR_L_MALLOC,
+    IPCACK_ERR_L_FREE,
+    IPCACK_ERR_L_DISK,
+    IPCACK_ERR_L_PERMISSIONS,
+    IPCACK_ERR_L_FD_LIMIT,
+    IPCACK_ERR_L_SIZE_TOO_SMALL,
+    IPCACK_ERR_L_NAME_COLLISION,
+    IPCACK_ERR_L_SEM_OPEN,
+    IPCACK_ERR_L_SEM_CLOSE,
+    IPCACK_ERR_L_SHM_OPEN,
+    IPCACK_ERR_L_SHM_CLOSE,
+    IPCACK_ERR_L_MMAP,
+    IPCACK_ERR_L_SEM,
+
+    IPCACK_ERR_L_ALREADY_OPEN,
+
+    IPCACK_ERR_L_UNKNOWN,
+
+    IPCACK_ERR_L_COUNT,
+} IPCAckErrorLow;
+
 /// Normal return.
-#define IPCACK_ERROR_NO_ERROR 0
-/// Given string is too long.
-#define IPCACK_ERROR_NAME_TOO_LONG 1
-/// Given string is not a valid address.
-#define IPCACK_ERROR_NAME_INVALID 2
-/// Given argument is invalid.
-#define IPCACK_ERROR_ARG_INVALID 3
-/// OS error while creating or opening resource.
-#define IPCACK_ERROR_SYSTEM 12
-/// The resource already exists.
-#define IPCACK_ERROR_EXISTS 13
-/// The buffer was wrongly edited.
-#define IPCACK_ERROR_BUFFER 14
-/// Call timed out.
-#define IPCACK_ERROR_TIMEOUT 100
+#define IPCACK_OK IPCACK_ERR_H_OK
 
 typedef uint8_t IPCAckPollStatus;
 #define IPCACK_POLL_ERROR 0x1
