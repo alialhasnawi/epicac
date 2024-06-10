@@ -1,3 +1,48 @@
+// TODO: API design.
+// Need to allow 0-copy messaging
+// Should be sync
+/*
+- client and server are created (order doesn't matter)
+- client or server can send as long as the other allows it
+- send API is made of multiple steps
+    - can send: only return when allowed to send
+    - send: signals to the other that a message was sent
+    * in between the 2, the actual writes happen
+- recieve API is simillar:
+    - can receive: only return when there's data to be used
+    - receive: signal to the other that the message has been used
+
+so basically:
+
+// server.c
+bind("blabla")
+
+if (until_can_recv(1000ms))
+    error!
+
+
+
+
+// client.c
+connect("blabla")
+
+bufs = get_bufs()
+
+if (until_can_send(1000ms))
+    error!
+
+bufs.send_buf[...] = ...
+send()
+
+if (until_can_recv(1000ms))
+    error!
+
+... = bufs.recv_buf[...]
+
+recv()
+
+*/
+
 #ifndef IPCACK_H
 #define IPCACK_H
 
@@ -40,8 +85,12 @@ typedef enum IPCAckErrorLow {
     IPCACK_ERR_L_SEM_CLOSE,
     IPCACK_ERR_L_SHM_OPEN,
     IPCACK_ERR_L_SHM_CLOSE,
+    IPCACK_ERR_L_MUTEX_OPEN,
+    IPCACK_ERR_L_MUTEX_CLOSE,
     IPCACK_ERR_L_MMAP,
     IPCACK_ERR_L_SEM,
+    IPCACK_ERR_L_MUTEX,
+    IPCACK_ERR_L_TIME,
 
     IPCACK_ERR_L_ALREADY_OPEN,
 
@@ -88,7 +137,7 @@ IPCAckError ipcack_server_resize(IPCAckServer server, uint64_t client, size_t ne
 /**
  * Create a new client socket and connect to a server.
  */
-IPCAckError ipcack_client_connect(IPCAckClient *client, char *name);
+IPCAckError ipcack_client_connect(IPCAckClient *client, char *name, uint32_t timeout_ms);
 IPCAckError ipcack_client_disconnect(IPCAckClient client);
 
 /**

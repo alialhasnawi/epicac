@@ -1,4 +1,7 @@
 // TODO: Do client init.
+// TODO: Do client disconnect.
+// TODO: Handle 2 servers trying to bind at the same time.
+
 // TODO: Do server-client loop.
 // TODO: Handle timeouts and exits.
 // TODO: Test in C.
@@ -20,7 +23,7 @@
 // Synchronization Primitives:
 // - The server has 1 semaphore to handle signals from clients (join, turn change).
 // - Each client has 1 semaphore to handle signals from the server (turn change).
-// - Client share 1 semaphore (mutex) to handle joining the server, to prevent concurrent
+// - Client share 1 mutex to handle joining the server, to prevent concurrent
 //   writes to the join shared memory area.
 
 #include "ipcack.h"
@@ -38,6 +41,7 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #endif
 
 #ifndef static_assert
@@ -53,27 +57,22 @@ static inline IPCAckError error(IPCAckErrorHigh err_high, IPCAckErrorLow err_low
 
 #define error(high, low) error(IPCACK_ERR_H_##high, IPCACK_ERR_L_##low)
 
-// Platform specific config.
-#ifdef IPCACK_WINDOWS
-typedef HANDLE ShmemFD;
-typedef HANDLE Semaphore;
-#elif defined(IPCACK_POSIX)
-typedef int ShmemFD;
-typedef sem_t *Semaphore;
-#endif
-
 // Compiler specific config.
-#if defined(_MSC_VER_)
+#if defined(_MSC_VER)
 #define thread_local __declspec(thread)
-#elif defined(_GNUC_) || defined(__clang__)
+#elif defined(__GNUC__) || defined(__clang__)
 #define thread_local __thread
 #else
-// TODO: uncomment
-// #error "Only MSVC, Clang, and GCC are supported."
-
+#error "Only MSVC, Clang, and GCC are supported."
 // These should be defined if porting to a new compiler.
 #define thread_local
 #endif
+
+// ███████ ████████ ██████  ██ ███    ██  ██████
+// ██         ██    ██   ██ ██ ████   ██ ██
+// ███████    ██    ██████  ██ ██ ██  ██ ██   ███
+//      ██    ██    ██   ██ ██ ██  ██ ██ ██    ██
+// ███████    ██    ██   ██ ██ ██   ████  ██████
 
 /// Common prefix to all system-wide named objects.
 #define IPCACK_PREFIX_LEN ((sizeof ipcack_prefix) - 1)
@@ -91,13 +90,15 @@ static_assert(IPCACK_FIXED_ID_BITS < 32,
 /// 8 character object specifier.
 #define IPCACK_OBJECT_TYPE_LEN 8
 #define DEFINE_IPCACK_OBJECT_TYPE_PREFIX(var, value)                                     \
-    static const char ipcack_prefix_##var[] = value;                                     \
+    static const char ipcack_prefix_##var[IPCACK_OBJECT_TYPE_LEN + 1] = value;           \
     static_assert((sizeof ipcack_prefix_##var - 1) == IPCACK_OBJECT_TYPE_LEN,            \
                   "Prefix length.")
 
 /// Shared memory: Waiting area for clients wanting to join server.
 DEFINE_IPCACK_OBJECT_TYPE_PREFIX(join_area, "joinarea");
-/// Mutex (using semaphore): For clients wanting to join server.
+/// Mutex: For servers wanting to bind an address.
+DEFINE_IPCACK_OBJECT_TYPE_PREFIX(server_bind_lock, "bindlock");
+/// Mutex: For clients wanting to join server.
 DEFINE_IPCACK_OBJECT_TYPE_PREFIX(join_lock, "joinlock");
 
 /// Shared memory: buffer for client-server messages.
@@ -115,21 +116,12 @@ DEFINE_IPCACK_OBJECT_TYPE_PREFIX(client_sem, "clientse");
 static_assert(IPCACK_MAX_SHMEM_NAME < 250,
               "Shared memory object name must be less than 250");
 
-#define IPCACK_MUTEX_ID_JOIN 0x0
-#define IPCACK_MUTEX_ID_
-
 typedef struct String {
-    /// Length in bytes, NOT characters or code points.
-    uint16_t len;
     /// Pointer to <len> count raw UTF-8 bytes, where bytes[len] = 0x0.
     char *bytes;
+    /// Length in bytes, NOT characters or code points.
+    uint16_t len;
 } String;
-
-typedef struct ShmemBuffer {
-    ShmemFD fd;
-    char *buf;
-    size_t size;
-} ShmemBuffer;
 
 static IPCAckError validate_shmem_name_external(const char *name) {
     size_t len = strnlen(name, IPCACK_MAX_NAME + 1);
@@ -139,7 +131,8 @@ static IPCAckError validate_shmem_name_external(const char *name) {
     if (len < 2) { // Name must be long enough.
         return error(ARGS, STRING_TOO_SHORT);
     }
-    if (strchr(name, '/') != NULL) { // Name must not contain any other /.
+    if ((strchr(name, '/') != NULL) ||
+        strchr(name, '\\') != NULL) { // Name must not contain any other / or \.
         return error(ARGS, STRING_INVALID);
     }
 
@@ -167,20 +160,20 @@ static inline size_t cat(char *buf, uint16_t start, uint16_t len, const char *ad
 // TODO: Unused.
 // static char string_scratch[IPCACK_MAX_SHMEM_NAME + 1];
 
-thread_local static char shmem_string_scratch[IPCACK_MAX_SHMEM_NAME + 1];
+static thread_local char shmem_string_scratch[IPCACK_MAX_SHMEM_NAME + 1];
 #define SHMEM_SCRATCH_SIZE                                                               \
     ((sizeof shmem_string_scratch) / (sizeof *shmem_string_scratch))
 
 typedef struct BuildNameParams {
     /// UTF-8 string of at most <IPCACK_MAX_NAME> bytes that has already been validated.
     String name;
-    const char (*object_type_str)[IPCACK_OBJECT_TYPE_LEN + 1];
+    const char(*object_type_str);
     uint32_t fixed_id;
     uint32_t dynamic_id;
     char b64_scratch[IPCACK_FIXED_ID_LEN];
 } BuildNameParams;
-static IPCAckError build_shmem_name(BuildNameParams *params, String *string, char *buf,
-                                    size_t bufsize) {
+static IPCAckError build_internal_obj_name(BuildNameParams *params, String *string,
+                                           char *buf, size_t bufsize) {
     size_t total_length_needed = 1 + IPCACK_MIN_SHMEM_NAME + params->name.len;
     if (bufsize < total_length_needed)
         return error(ARGS, STRING_TOO_LONG);
@@ -210,7 +203,7 @@ static IPCAckError build_shmem_name(BuildNameParams *params, String *string, cha
 /// While only at most `IPCACK_MAX_SHMEM_NAME` `WCHAR`s are needed to convert to UTF-16,
 /// extra space is added just in case.
 /// + 1 added for null-terminator.
-thread_local static WCHAR wide_char_scratch[IPCACK_MAX_SHMEM_NAME * 2 + 1];
+static thread_local WCHAR wide_char_scratch[IPCACK_MAX_SHMEM_NAME * 2 + 1];
 #define WIDE_CHAR_SCRATCH_SIZE ((sizeof wide_char_scratch) / (sizeof *wide_char_scratch))
 
 static IPCAckError utf8_to_wide_char_scratch(const char *name, size_t len, WCHAR buf[],
@@ -237,12 +230,30 @@ static IPCAckError utf8_to_wide_char_scratch(const char *name, size_t len, WCHAR
 }
 #endif
 
+// ███████ ██   ██ ███    ███ ███████ ███    ███
+// ██      ██   ██ ████  ████ ██      ████  ████
+// ███████ ███████ ██ ████ ██ █████   ██ ████ ██
+//      ██ ██   ██ ██  ██  ██ ██      ██  ██  ██
+// ███████ ██   ██ ██      ██ ███████ ██      ██
+
+#ifdef IPCACK_WINDOWS
+typedef HANDLE ShmemFD;
+#elif defined(IPCACK_POSIX)
+typedef int ShmemFD;
+#endif
+
+typedef struct ShmemBuffer {
+    ShmemFD fd;
+    char *buf;
+    size_t size;
+} ShmemBuffer;
+
 /// @brief Open a shared memory buffer.
 /// @param shmem Buffer to initialize.
 /// @param name Null-terminated `String` of length 2-`IPCACK_MAX_SHMEM_NAME`, containing
 /// exactly 1 `/` as the first character.
 /// @return
-static IPCAckError open_shmem(ShmemBuffer *shmem, String name) {
+static IPCAckError open_shmem(ShmemBuffer *shmem, String name, bool *already_open) {
 #ifdef IPCACK_WINDOWS
     IPCAckError err = IPCACK_OK;
 
@@ -257,6 +268,10 @@ static IPCAckError open_shmem(ShmemBuffer *shmem, String name) {
         return error(SYS, SHM_OPEN);
     }
 
+    if (already_open != NULL) {
+        *already_open = GetLastError() == ERROR_ALREADY_EXISTS;
+    }
+
     void *buf = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, shmem->size);
     if (buf == NULL) {
         CloseHandle(handle);
@@ -268,77 +283,124 @@ static IPCAckError open_shmem(ShmemBuffer *shmem, String name) {
     return err;
 
 #elif defined(IPCACK_POSIX)
-    int fd_or_err = shm_open(name->bytes, O_CREAT | O_RDWR, 0644);
-    if (fd_or_err == -1) {
-        return IPCACK_ERROR_SYSTEM;
+    int fd_or_err = 0;
+    if (already_open != NULL) {
+        // Assume it already exists. Try and open without O_CREAT first.
+        *already_open = true;
+        fd_or_err = shm_open(name->bytes, O_RDWR, 0644);
+        if ((fd_or_err == -1) && (errno == ENOENT)) {
+            // If it doesn't exist, set `already_open` and create it.
+            fd_or_err = shm_open(name->bytes, O_CREAT | O_RDWR, 0644);
+            *already_open = false;
+        }
+    } else {
+        fd_or_err = shm_open(name->bytes, O_CREAT | O_RDWR, 0644);
     }
+    if (fd_or_err == -1) {
+        return error(SYS, SHM_OPEN);
+    }
+
     if (ftruncate(fd_or_err, shmem->size) == -1) {
         shm_unlink(shmem->name);
-        return IPCACK_ERROR_SYSTEM;
+        return error(SYS, SHM_OPEN);
     }
 
     void *buf = mmap(NULL, shmem->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_or_err, 0);
     if (buf == MAP_FAILED) {
-        shm_unlink(shmem->name);
-        return IPCACK_ERROR_SYSTEM;
+        close(fd_or_err);
+        return error(SYS, MMAP);
     }
 
     shmem->fd = fd_or_err;
     shmem->buf = buf;
-#endif
     return IPCACK_OK;
+#endif
 }
 
 /// @brief Close an open shared memory buffer. Unmap and close the associated handle.
 /// @param shmem Buffer to close.
 /// @param name Null-terminated `String` of length 2-`IPCACK_MAX_SHMEM_NAME`, containing
 /// exactly 1 `/` as the first character.
-/// @return 
-static IPCAckError close_shmem(ShmemBuffer *shmem, const char *name) {
+/// @return
+static IPCAckError close_shmem(ShmemBuffer shmem) {
 #ifdef IPCACK_WINDOWS
     BOOL success = TRUE;
-    success = success && UnmapViewOfFile(shmem->buf);
-    success = success && CloseHandle(shmem->fd);
+    success = success && UnmapViewOfFile(shmem.buf);
+    success = success && CloseHandle(shmem.fd);
     return success ? IPCACK_OK : error(SYS, FREE);
 #elif defined(IPCACK_POSIX)
     bool success = true;
-    success = success && (munmap(shmem->buf, shmem->size) == 0);
-    success = success && (shm_unlink(name) == 0);
+    success = success && (munmap(shmem.buf, shmem.size) == 0);
+    success = success && (close(shmem.fd) == 0);
     return success ? IPCACK_OK : error(SYS, FREE);
 #endif
 }
+
+#ifdef IPCACK_POSIX
+static IPCAckError destroy_shmem(const char *name) {
+    return (shm_unlink(name) == 0) ? IPCACK_OK : error(SYS, FREE);
+}
+#endif
+
+#define IPCACK_WAIT_SUCCESS 0x0
+#define IPCACK_WAIT_TIMEOUT 0x1
+#define IPCACK_WAIT_ERROR 0x8
+
+// ███████ ███████ ███    ███  █████  ██████  ██   ██  ██████  ██████  ███████
+// ██      ██      ████  ████ ██   ██ ██   ██ ██   ██ ██    ██ ██   ██ ██
+// ███████ █████   ██ ████ ██ ███████ ██████  ███████ ██    ██ ██████  █████
+//      ██ ██      ██  ██  ██ ██   ██ ██      ██   ██ ██    ██ ██   ██ ██
+// ███████ ███████ ██      ██ ██   ██ ██      ██   ██  ██████  ██   ██ ███████
+
+#ifdef IPCACK_WINDOWS
+typedef HANDLE Semaphore;
+#elif defined(IPCACK_POSIX)
+typedef sem_t *Semaphore;
+#endif
 
 /**
  * Open a named semaphore.
  * <name> must be a null-terminated string of length 2-255 starting with '/' and not
  * containing any other '/' characters.
  */
-static IPCAckError open_semaphore(Semaphore *semaphore, String *name,
-                                  unsigned int value) {
+static IPCAckError open_semaphore(Semaphore *semaphore, String name) {
 #ifdef IPCACK_WINDOWS
     IPCAckError err = IPCACK_OK;
-    if ((err = utf8_to_wide_char_scratch(name->bytes, name->len, wide_char_scratch,
+    if ((err = utf8_to_wide_char_scratch(name.bytes, name.len, wide_char_scratch,
                                          WIDE_CHAR_SCRATCH_SIZE)) != 0) {
         return err;
     }
-    HANDLE sem = CreateSemaphoreW(NULL, value, LONG_MAX, wide_char_scratch);
+    HANDLE sem = CreateSemaphoreW(NULL, 0, LONG_MAX, wide_char_scratch);
     if (sem == NULL) {
         return error(SYS, SEM_OPEN);
     }
     *semaphore = sem;
+    return IPCACK_OK;
 #elif defined(IPCACK_POSIX)
-    Semaphore sem = sem_open(name, O_CREAT, 0644, value);
+    Semaphore sem = sem_open(name, O_CREAT, 0644, 0);
     if (sem == SEM_FAILED) {
-        return IPCACK_ERROR_SYSTEM;
+        return error(SYS, SEM_OPEN);
     }
     *semaphore = sem;
-#endif
     return IPCACK_OK;
+#endif
 }
 
-#define IPCACK_WAIT_SUCCESS 0x0
-#define IPCACK_WAIT_TIMEOUT 0x1
-#define IPCACK_WAIT_ERROR 0x8
+static IPCAckError close_semaphore(Semaphore sem) {
+#ifdef IPCACK_WINDOWS
+    BOOL success = CloseHandle(sem);
+    return success ? IPCACK_OK : error(SYS, FREE);
+#elif defined(IPCACK_POSIX)
+    bool success = (sem_close(sem) == 0);
+    return success ? IPCACK_OK : error(SYS, FREE);
+#endif
+}
+
+#ifdef IPCACK_POSIX
+static IPCAckError destroy_semaphore(const char *name) {
+    return (sem_unlink(name) == 0) ? IPCACK_OK : error(SYS, FREE);
+}
+#endif
 
 static IPCAckError wait_semaphore(Semaphore sem, uint32_t timeout_ms) {
 #ifdef IPCACK_WINDOWS
@@ -355,8 +417,10 @@ static IPCAckError wait_semaphore(Semaphore sem, uint32_t timeout_ms) {
     }
 #elif defined(IPCACK_POSIX)
     struct timespec ts;
-    ts.tv_sec = timeout_ms / 1000;
-    ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return error(SYS, TIME);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
     int status = sem_timedwait(sem, &ts);
     if (status == 0) {
         return IPCACK_WAIT_SUCCESS;
@@ -374,26 +438,172 @@ static IPCAckError wait_semaphore(Semaphore sem, uint32_t timeout_ms) {
 
 static IPCAckError post_semaphore(Semaphore sem) {
 #ifdef IPCACK_WINDOWS
-    BOOL status = ReleaseSemaphore(sem, 1, NULL);
-    return (status != 0) ? IPCACK_OK : error(SYS, SEM);
+    BOOL success = ReleaseSemaphore(sem, 1, NULL);
+    return success ? IPCACK_OK : error(SYS, SEM);
 #elif defined(IPCACK_POSIX)
-    int status = sem_post(sem);
-    return (status == 0) ? IPCACK_OK : IPCACK_ERROR_SYSTEM;
+    bool success = (sem_post(sem) == 0);
+    return success ? IPCACK_OK : error(SYS, SEM);
 #endif
 }
 
-static IPCAckError close_semaphore(Semaphore sem, const char *name) {
+// ███    ███ ██    ██ ████████ ███████ ██   ██
+// ████  ████ ██    ██    ██    ██       ██ ██
+// ██ ████ ██ ██    ██    ██    █████     ███
+// ██  ██  ██ ██    ██    ██    ██       ██ ██
+// ██      ██  ██████     ██    ███████ ██   ██
+
 #ifdef IPCACK_WINDOWS
-    (void)name;
-    BOOL status = CloseHandle(sem);
-    return (status != 0) ? IPCACK_OK : error(SYS, FREE);
+typedef HANDLE Mutex;
 #elif defined(IPCACK_POSIX)
-    bool success = true;
-    success = success && (sem_close(sem) == 0);
-    success = success && (sem_unlink(name) == 0);
-    return success ? IPCACK_OK : error(SYS, FREE);
+struct WrappedPosixMutex {
+    pthread_mutex_t mutex;
+    uint32_t initialized_canary;
+};
+struct PosixMutexPolyfill {
+    WrappedPosixMutex *shared;
+    ShmemBuffer shmem;
+};
+typedef struct PosixMutexPolyfill Mutex;
+
+static void short_nap() {
+    struct timespec req, rem;
+    ts.tv_sec = 0;
+    // Sleep for at least 1000ns = 1us, but because of the scheduler, actually sleep for
+    // some unknown amount of time greater than this. This isn't an RTOS!
+    ts.tv_nsec = 1000;
+    if ((nanosleep(&req, &rem) == -1) && (errno == EINTR))
+        nanosleep(rem, NULL);
+}
+
+#endif
+
+/**
+ * Open a named mutex.
+ * <name> must be a null-terminated string of length 2-255 starting with '/' and not
+ * containing any other '/' or '\' characters.
+ */
+static IPCAckError open_mutex(Mutex *mutex, String name) {
+#ifdef IPCACK_WINDOWS
+    IPCAckError err = IPCACK_OK;
+    if ((err = utf8_to_wide_char_scratch(name.bytes, name.len, wide_char_scratch,
+                                         WIDE_CHAR_SCRATCH_SIZE)) != 0) {
+        return err;
+    }
+    HANDLE mut = CreateMutexW(NULL, FALSE, wide_char_scratch);
+    if (mut == NULL) {
+        return error(SYS, MUTEX_OPEN);
+    }
+    *mutex = mut;
+    return IPCACK_OK;
+#elif defined(IPCACK_POSIX)
+    IPCAckError err = IPCACK_OK;
+
+    mutex->shmem.size = sizeof(WrappedPosixMutex);
+    bool shmem_exists = false;
+    IPCAckError err = open_shmem(&mutex->shmem, &name, &shmem_exists);
+    if (err != IPCACK_OK)
+        return err;
+    mutex->shared = (WrappedPosixMutex *)shmem.buf;
+
+    // Allow other thread to initialize first.
+    // If this does not happen, assume ownership and initialize it.
+    if (shmem_exists && (mutex->shared.initialized_canary != INITIALIZED_CANARY)) {
+        short_nap();
+    }
+
+    if (mutex->shared.initialized_canary != INITIALIZED_CANARY) {
+        pthread_mutexattr_t attr;
+        if ((pthread_mutexattr_init(&attr) != 0) ||
+            (pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) != 0) ||
+            (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) != 0) ||
+            (pthread_mutex_init(&mutex->shared->mutex, &attr) != 0)) {
+            // Unset on error to allow other threads to try.
+            mutex->shared.initialized_canary = 0;
+            err = error(SYS, MUTEX_OPEN);
+            close_shmem(mutex->shmem);
+            // Leak shared memory by not calling unlink. It will be collected by the
+            // server, or on restart if the server failed to initialize this.
+        }
+        mutex->shared.initialized_canary = INITIALIZED_CANARY;
+    }
+
+    return err;
 #endif
 }
+
+static IPCAckError close_mutex(Mutex mutex) {
+#ifdef IPCACK_WINDOWS
+    BOOL success = CloseHandle(mutex);
+    return success ? IPCACK_OK : error(SYS, FREE);
+#elif defined(IPCACK_POSIX)
+    return close_shmem(mutex.shmem);
+#endif
+}
+
+#ifdef IPCACK_POSIX
+static IPCAckError destroy_mutex(Mutex mutex, const char *name) {
+    int mutex_err = pthread_mutex_destroy(&mutex.shared->mutex);
+    IPCAckError err = destroy_shmem(name);
+    mutex.shared->initialized_canary = 0;
+    if (mutex_err != 0)
+        return error(SYS, MUTEX_CLOSE);
+    return err;
+}
+#endif
+
+static IPCAckError wait_mutex(Mutex mutex, uint32_t timeout_ms) {
+#ifdef IPCACK_WINDOWS
+    DWORD status = WaitForSingleObject(mutex, timeout_ms);
+    switch (status) {
+    case WAIT_OBJECT_0:
+    case WAIT_ABANDONED:
+        return IPCACK_WAIT_SUCCESS;
+    case WAIT_TIMEOUT:
+        return IPCACK_WAIT_TIMEOUT;
+    case WAIT_FAILED:
+    default:
+        return IPCACK_WAIT_ERROR;
+    }
+#elif defined(IPCACK_POSIX)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return error(SYS, TIME);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    int status = pthread_mutex_timedlock(&mutex.shared->mutex, &ts);
+    if (status == 0) {
+        return IPCACK_WAIT_SUCCESS;
+    }
+    switch (errno) {
+    case EOWNERDEAD: // Analogous to WAIT_ABANDONED in Win32.
+        // WARNING: Unchecked error.
+        pthread_mutex_consistent(&mutex.shared->mutex);
+        return IPCACK_WAIT_SUCCESS;
+    case ETIMEDOUT:
+        return IPCACK_WAIT_TIMEOUT;
+    case EINTR:
+    case EINVAL:
+    default:
+        return IPCACK_WAIT_ERROR;
+    }
+#endif
+}
+
+static IPCAckError release_mutex(Mutex mutex) {
+#ifdef IPCACK_WINDOWS
+    BOOL success = ReleaseMutex(mutex);
+    return success ? IPCACK_OK : error(SYS, MUTEX);
+#elif defined(IPCACK_POSIX)
+    bool success = (pthread_mutex_unlock(&mutex.shared->mutex) == 0);
+    return success ? IPCACK_OK : error(SYS, MUTEX);
+#endif
+}
+
+// ████████ ██    ██ ██████  ███████ ███████
+//    ██     ██  ██  ██   ██ ██      ██
+//    ██      ████   ██████  █████   ███████
+//    ██       ██    ██      ██           ██
+//    ██       ██    ██      ███████ ███████
 
 #define DEFINE_ARRAY(Type, TypeName)                                                     \
     typedef struct TypeName {                                                            \
@@ -494,6 +704,12 @@ typedef struct Client {
     char name[];
 } Client;
 
+// ███████ ███████ ██████  ██    ██ ███████ ██████
+// ██      ██      ██   ██ ██    ██ ██      ██   ██
+// ███████ █████   ██████  ██    ██ █████   ██████
+//      ██ ██      ██   ██  ██  ██  ██      ██   ██
+// ███████ ███████ ██   ██   ████   ███████ ██   ██
+
 IPCAckError ipcack_server_bind(IPCAckServer *server, char *name) {
     IPCAckError err = IPCACK_OK;
     bool server_alloced = false;
@@ -517,6 +733,7 @@ IPCAckError ipcack_server_bind(IPCAckServer *server, char *name) {
         err = error(SYS, MALLOC);
         goto error_cleanup;
     }
+
     server_alloced = true;
 
     // Initialize internal name storage.
@@ -527,15 +744,16 @@ IPCAckError ipcack_server_bind(IPCAckServer *server, char *name) {
     // Initialize client array list.
     if ((err = Array_ClientConnection_new(&ptr->clients, 8)))
         goto error_cleanup;
+
     client_array_alloced = true;
 
     // // Create a semaphore for joining (acts as a mutex)
     // String join_sem_name = {0};
-    // err = build_shmem_name(
+    // err = build_internal_obj_name(
     //     &(BuildNameParams){.dynamic_id = 0,
     //                        .fixed_id = 0,
     //                        .name = (String){.len = ptr->name_len, .bytes = ptr->name},
-    //                        .object_type_str = &ipcack_prefix_mutex},
+    //                        .object_type_str = ipcack_prefix_mutex},
     //     &join_sem_name, ptr->string_buffer, sizeof(ptr->string_buffer));
     // if (err)
     //     goto error_cleanup;
@@ -545,42 +763,44 @@ IPCAckError ipcack_server_bind(IPCAckServer *server, char *name) {
 
     // Create a semaphore for server events
     String server_sem_name = {0};
-    err = build_shmem_name(
+    err = build_internal_obj_name(
         &(BuildNameParams){.name = (String){.len = ptr->name_len, .bytes = ptr->name},
-                           .object_type_str = &ipcack_prefix_server_sem},
-        &server_sem_name, shmem_string_scratch, shmem_string_scratch);
+                           .object_type_str = ipcack_prefix_server_sem},
+        &server_sem_name, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (err)
         goto error_cleanup;
-    err = open_semaphore(&ptr->server_event_sem, &server_sem_name, 1);
+    err = open_semaphore(&ptr->server_event_sem, server_sem_name);
     if (err)
         goto error_cleanup;
+
     open_sem_opened = true;
 
     // Open the shared memory buffer.
     String join_shmem_name = {0};
-    err = build_shmem_name(
+    err = build_internal_obj_name(
         &(BuildNameParams){.name = (String){.len = ptr->name_len, .bytes = ptr->name},
-                           .object_type_str = &ipcack_prefix_join_area},
+                           .object_type_str = ipcack_prefix_join_area},
         &join_shmem_name, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (err)
         goto error_cleanup;
 
     printf("shmem name is '%s'\n", join_shmem_name.bytes);
     ptr->join_shmem = (ShmemBuffer){.size = sizeof(JoinArea)};
-    if ((err = open_shmem(&ptr->join_shmem, join_shmem_name)))
+    if ((err = open_shmem(&ptr->join_shmem, join_shmem_name, NULL)))
         goto error_cleanup;
 
     shmem_opened = true;
 
-    const uint32_t initial_counter_value = 0x0;
-    ((JoinArea *)ptr->join_shmem.buf)->counter = initial_counter_value;
-    ptr->join_last_counter = initial_counter_value;
-
     JoinArea *join_area = (JoinArea *)ptr->join_shmem.buf;
+
     if (join_area->server_alive == true) {
         err = error(IPC, ALREADY_OPEN);
         goto error_cleanup;
     }
+
+    const uint32_t initial_counter_value = 0x0;
+    join_area->counter = initial_counter_value;
+    ptr->join_last_counter = initial_counter_value;
 
     join_area->server_alive = true;
 
@@ -591,22 +811,30 @@ IPCAckError ipcack_server_bind(IPCAckServer *server, char *name) {
 
 error_cleanup:
     if (shmem_opened) {
+        close_shmem(ptr->join_shmem);
+
+#ifdef IPCACK_POSIX
         String join_shmem_name = {0};
-        IPCAckError err = build_shmem_name(
+        IPCAckError err = build_internal_obj_name(
             &(BuildNameParams){.name = (String){.len = ptr->name_len, .bytes = ptr->name},
-                               .object_type_str = &ipcack_prefix_join_area},
+                               .object_type_str = ipcack_prefix_join_area},
             &join_shmem_name, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-        if (!err)
-            close_shmem(&ptr->join_shmem, join_shmem_name.bytes);
+        if (!err) {
+            destroy_shmem(join_shmem_name.bytes);
+        }
+#endif
     }
     if (open_sem_opened) {
+        close_semaphore(ptr->server_event_sem);
+#ifdef IPCACK_POSIX
         String server_sem_name = {0};
-        IPCAckError err = build_shmem_name(
+        IPCAckError err = build_internal_obj_name(
             &(BuildNameParams){.name = (String){.len = ptr->name_len, .bytes = ptr->name},
-                               .object_type_str = &ipcack_prefix_server_sem},
+                               .object_type_str = ipcack_prefix_server_sem},
             &server_sem_name, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
         if (!err)
-            close_semaphore(ptr->server_event_sem, server_sem_name.bytes);
+            destroy_semaphore(server_sem_name.bytes);
+#endif
     }
     if (client_array_alloced)
         Array_ClientConnection_free(&ptr->clients);
@@ -632,20 +860,28 @@ IPCAckError ipcack_server_close(IPCAckServer server) {
 
     // This resource cleanup should be done in the same way everywhere it's needed.
     // Close system resources.
+    close_shmem(ptr->join_shmem);
+#ifdef IPCACK_POSIX
     String join_shmem_name = {0};
-    err = build_shmem_name(
+    err = build_internal_obj_name(
         &(BuildNameParams){.name = (String){.len = ptr->name_len, .bytes = ptr->name},
-                           .object_type_str = &ipcack_prefix_join_area},
+                           .object_type_str = ipcack_prefix_join_area},
         &join_shmem_name, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    close_shmem(&ptr->join_shmem, join_shmem_name.bytes);
+    if (!err)
+        ;
+    destory_shmem(join_shmem_name.bytes);
+#endif
 
+    close_semaphore(ptr->server_event_sem);
+#ifdef IPCACK_POSIX
     String server_sem_name = {0};
-    err = build_shmem_name(
+    err = build_internal_obj_name(
         &(BuildNameParams){.name = (String){.len = ptr->name_len, .bytes = ptr->name},
-                           .object_type_str = &ipcack_prefix_server_sem},
+                           .object_type_str = ipcack_prefix_server_sem},
         &server_sem_name, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (!err)
-        close_semaphore(ptr->server_event_sem, server_sem_name.bytes);
+        destroy_semaphore(server_sem_name.bytes);
+#endif
 
     // Free all memory related to clients.
     Array_ClientConnection_free(&ptr->clients);
@@ -657,7 +893,15 @@ IPCAckError ipcack_server_close(IPCAckServer server) {
     return IPCACK_OK;
 }
 
+//  ██████ ██      ██ ███████ ███    ██ ████████
+// ██      ██      ██ ██      ████   ██    ██
+// ██      ██      ██ █████   ██ ██  ██    ██
+// ██      ██      ██ ██      ██  ██ ██    ██
+//  ██████ ███████ ██ ███████ ██   ████    ██
+
 IPCAckError ipcack_client_connect(IPCAckClient *client, char *name, uint32_t timeout_ms) {
+    (void)timeout_ms;
+
     IPCAckError err = IPCACK_OK;
     bool client_alloced = false;
 
@@ -686,10 +930,9 @@ IPCAckError ipcack_client_connect(IPCAckClient *client, char *name, uint32_t tim
 
     // Open the join waiting area shared memory.
 
+    // Connect to server.
 
-    // Open the join waiting area shared memory.
-
-
+    // Open given shared memory.
 
     ptr->initialized_canary = INITIALIZED_CANARY;
     client->internal = ptr;
@@ -703,4 +946,7 @@ error_cleanup:
     return err;
 }
 
-IPCAckError ipcack_client_disconnect(IPCAckClient client) {}
+IPCAckError ipcack_client_disconnect(IPCAckClient client) {
+    (void)client;
+    return IPCACK_OK;
+}
