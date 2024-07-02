@@ -3,7 +3,7 @@ TARGET_EXEC ?= main
 
 BUILD_DIR ?= ./build
 
-SRCS := ipcack.c meow.c
+SRCS := epicac.c meow.c
 OBJS := $(SRCS:%=$(BUILD_DIR)/%.o)
 
 INC_DIRS := .
@@ -23,5 +23,18 @@ $(BUILD_DIR)/%.c.o: %.c
 
 clean:
 	$(RM) -r $(BUILD_DIR)
+
+# TODO:
+# all:
+# default:
+# test:
+# format:
+# lint:
+# static:
+# shared:
+# node:
+# python:
+
+
 
 MKDIR_P ?= mkdir -p

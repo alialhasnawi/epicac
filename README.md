@@ -1,2 +1,3 @@
-# ipcack
-ACK-based IPC
+# epicac
+
+Shared memory IPC.
