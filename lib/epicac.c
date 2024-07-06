@@ -1,21 +1,3 @@
-/*
-TODO:
-- add mutex to server init
-- refactor to use ordered defer instead of many bools
-- client init and join
-- server loop
-- client close
-- client send and receive
-- write tests
-*/
-// TODO: Do client init.
-// TODO: Do client disconnect.
-// TODO: Handle 2 servers trying to bind at the same time.
-
-// TODO: Do server-client loop.
-// TODO: Handle timeouts and exits.
-// TODO: Test in C.
-// TODO: Wrap in python API.
 // Add better error checking.
 
 // STRING CONVENTION : All strings should include their length.
@@ -168,10 +150,6 @@ static inline size_t cat(char *buf, uint16_t start, uint16_t len, const char *ad
         buf[start + i] = addition[i];
     return i;
 }
-
-// TODO: Make thread safe.
-// TODO: Unused.
-// static char string_scratch[EPC_MAX_SHMEM_NAME + 1];
 
 static thread_local char shmem_string_scratch[EPC_MAX_SHMEM_NAME + 1];
 #define SHMEM_SCRATCH_SIZE                                                               \
@@ -615,51 +593,6 @@ static EPCError release_mutex(Mutex mutex) {
 #endif
 }
 
-// ██    ██ ████████ ██ ██      ███████
-// ██    ██    ██    ██ ██      ██
-// ██    ██    ██    ██ ██      ███████
-// ██    ██    ██    ██ ██           ██
-//  ██████     ██    ██ ███████ ███████
-// void sleep_ms(uint32_t time_ms) {
-// #ifdef EPC_WINDOWS
-//     Sleep(time_ms);
-// #elif defined(EPC_POSIX)
-//     struct timespec req, rem;
-//     ts.tv_sec = timeout_ms / 1000;
-//     ts.tv_nsec = (timeout_ms % 1000) * 1000000;
-//     if ((nanosleep(&req, &rem) == -1) && (errno == EINTR))
-//         nanosleep(rem, NULL);
-// #endif
-// }
-
-// typedef enum PollStage {
-//     POLL_STAGE_SPIN = 0,
-//     POLL_STAGE_15MS = 1,
-//     POLL_STAGE_1S = 2,
-// } PollStage;
-
-// typedef struct PollTimeout {
-//     uint32_t ms;
-//     uint8_t stage;
-// } PollTimeout;
-
-#define STRINGIZE_(x) #x
-#define STRINGIZE(x) STRINGIZE_(x)
-
-uint64_t monotonic_time_ms() {
-#ifdef EPC_WINDOWS
-    return GetTickCount64();
-#elif defined(EPC_POSIX)
-    struct timespec ts = {0};
-    // TODO: Verify if this behaviour is desired.
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        perror(__FILE__ ", line " STRINGIZE(__LINE__)", epicac.monotonic_time_ms.clock_gettime failed");
-        return 0;
-    }
-    return ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
-#endif
-}
-
 // ████████ ██    ██ ██████  ███████ ███████
 //    ██     ██  ██  ██   ██ ██      ██
 //    ██      ████   ██████  █████   ███████
@@ -745,15 +678,18 @@ typedef struct ClientConnection {
     ShmemBuffer shmem;
     Semaphore client_sem;
     uint64_t last_response_time_ms;
+    bool other_side_initialized;
 } ClientConnection;
 
 DEFINE_ARRAY(ClientConnection, Array_ClientConnection)
 
 typedef struct JoinArea {
-    uint32_t fixed_id;     // Server writable, client readable.
-    uint32_t initial_size; // Server writable, client readable.
-    uint32_t counter;      // Write locked: Client writable, server readable.
-    bool server_alive;     // Server writable, client readable.
+    char magic_string[sizeof EPICAC_HEADER]; // Should be set to EPICAC_HEADER.
+    uint32_t fixed_id;                       // Server writable, client readable.
+    uint32_t initial_size;                   // Server writable, client readable.
+    uint8_t server_ready;                    // Client sets to false, server sets to true.
+    uint8_t client_ready;                    // Server sets to false, client sets to true.
+    uint8_t server_alive;                    // Server writable, client readable.
 } JoinArea;
 
 typedef enum SharedTurn {
@@ -774,10 +710,10 @@ const char EPICAC_HEADER[17] = "\x8F"   // High bit byte.
 
 typedef struct SharedBufferHeader {
     char magic_string[sizeof EPICAC_HEADER]; // Should be set to EPICAC_HEADER.
-    uint8_t turn;          // Whether this buffer should be written to or not.
-    uint64_t buffer_size;  // Total capacity of the buffer, ie. maximum message size.
-    uint64_t message_size; // Size of most recent message OR new size to upgrade to.
-    uint8_t *ptr;          // Pointer to start of message.
+    uint8_t turn;        // Whether this buffer should be written to or not.
+    size_t buffer_size;  // Total capacity of the buffer, ie. maximum message size.
+    size_t message_size; // Size of most recent message OR new size to upgrade to.
+    uint8_t *ptr;        // Pointer to start of message.
 } SharedBufferHeader;
 
 typedef struct SharedBuffer {
@@ -794,7 +730,6 @@ typedef struct Server {
 
     Mutex address_mutex;
 
-    uint32_t join_last_counter;
     Mutex join_mutex;
     ShmemBuffer join_shmem;
     Semaphore join_semaphore;
@@ -812,6 +747,129 @@ typedef struct Client {
     uint16_t name_len;
     char name[];
 } Client;
+
+// ██    ██ ████████ ██ ██      ███████
+// ██    ██    ██    ██ ██      ██
+// ██    ██    ██    ██ ██      ███████
+// ██    ██    ██    ██ ██           ██
+//  ██████     ██    ██ ███████ ███████
+
+#define STRINGIZE_(x) #x
+#define STRINGIZE(x) STRINGIZE_(x)
+
+uint64_t monotonic_time_ms() {
+#ifdef EPC_WINDOWS
+    return GetTickCount64();
+#elif defined(EPC_POSIX)
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        perror(__FILE__ ", line " STRINGIZE(__LINE__)", epicac.monotonic_time_ms.clock_gettime failed");
+        return 0;
+    }
+    return ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
+#endif
+}
+
+bool update_timeout(uint64_t *last_time, uint32_t *timeout_ms) {
+    uint64_t now = monotonic_time_ms();
+    assert(*last_time <= now);
+    uint64_t elapsed = now - *last_time;
+    *last_time = now;
+
+    if (*timeout_ms <= elapsed) {
+        *timeout_ms = 0;
+        return true;
+    } else { // elapsed < *timeout_ms
+        *timeout_ms -= elapsed;
+    }
+
+    return false;
+}
+
+void sleep_ms(uint32_t time_ms) {
+#ifdef EPC_WINDOWS
+    Sleep(time_ms);
+#elif defined(EPC_POSIX)
+    struct timespec req, rem;
+    ts.tv_sec = timeout_ms / 1000;
+    ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+    if ((nanosleep(&req, &rem) == -1) && (errno == EINTR))
+        nanosleep(rem, NULL);
+#endif
+}
+
+typedef enum PollStage {
+    POLL_STAGE_SPIN = 0,
+    POLL_STAGE_15MS,
+    POLL_STAGE_1S,
+} PollStage;
+
+typedef struct BackoffTimeout {
+    uint32_t ms;
+    uint8_t stage;
+    uint8_t iterations;
+} BackoffTimeout;
+
+uint8_t get_next_backoff_stage(uint8_t current_backoff_stage) {
+    switch (current_backoff_stage) {
+    case POLL_STAGE_SPIN:
+        return POLL_STAGE_15MS;
+    case POLL_STAGE_15MS:
+    case POLL_STAGE_1S:
+        return POLL_STAGE_1S;
+    default:
+        assert(false && current_backoff_stage <= POLL_STAGE_1S);
+    }
+}
+
+bool backoff_timeout(BackoffTimeout *timeout) {
+    uint64_t start_time = monotonic_time_ms();
+
+    if (timeout->stage == POLL_STAGE_SPIN) {
+        // TODO: Make sure this doesn't get optimized out.
+        for (int i = 0; i < 1000; ++i)
+            ;
+    } else if (timeout->stage == POLL_STAGE_15MS) {
+        sleep_ms(15);
+    } else {
+        assert(timeout->stage == POLL_STAGE_1S);
+        sleep_ms(1000);
+    }
+
+    uint64_t time_elapsed = monotonic_time_ms() - start_time;
+
+    // Advance to the next, lower resolution step in the backoff.
+    timeout->iterations++;
+    if (timeout->iterations > 200) {
+        timeout->iterations = 0;
+        timeout->stage = get_next_backoff_stage(timeout->stage);
+    }
+
+    if (time_elapsed >= timeout->ms) {
+        timeout->ms = 0;
+        return true;
+    } else {
+        timeout->ms -= time_elapsed;
+        return false;
+    }
+}
+
+size_t initial_size_of_buffer(size_t total_size) {
+    return (total_size - sizeof(SharedBuffer)) / 2;
+}
+
+typedef enum EPCSide {
+    SIDE_SERVER = 0x0,
+    SIDE_CLIENT = 0x1,
+} EPCSide;
+
+ptrdiff_t get_ptrdiff_from_side(EPCSide side, size_t buffer_size, size_t shmem_size) {
+    if (side == SIDE_SERVER) {
+        return (ptrdiff_t)0;
+    }
+
+    return (ptrdiff_t)shmem_size - buffer_size - sizeof(SharedBuffer);
+}
 
 // ███████ ███████ ██████  ██    ██ ███████ ██████
 // ██      ██      ██   ██ ██    ██ ██      ██   ██
@@ -937,11 +995,12 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
     if ((err = open_semaphore(&ptr->join_semaphore, str)).high)
         goto CLEANUP;
 
-    const uint32_t initial_counter_value = 0x0;
-    join_area->counter = initial_counter_value;
-    ptr->join_last_counter = initial_counter_value;
-
     join_area->server_alive = true;
+    *join_area = (JoinArea){.server_alive = true,
+                            .client_ready = false,
+                            .server_ready = true,
+                            .initial_size = 0,
+                            .fixed_id = 0};
 
     ptr->initialized = INITIALIZED_CANARY;
     server->internal = ptr;
@@ -1048,6 +1107,21 @@ EPCError epc_server_close(EPCServer server) {
     return EPC_OK;
 }
 
+EPCError epc_server_accept(EPCServer server) {
+    EPCError err = EPC_OK;
+    Server *ptr = (Server *)server.internal;
+
+    volatile JoinArea *join_area = (volatile JoinArea *)ptr->join_shmem.buf;
+
+    if (join_area->server_ready != false) {
+        return EPC_OK;
+    }
+
+    ClientConnection connection = {0};
+
+    connection.last_response_time_ms = monotonic_time_ms();
+}
+
 //  ██████ ██      ██ ███████ ███    ██ ████████
 // ██      ██      ██ ██      ████   ██    ██
 // ██      ██      ██ █████   ██ ██  ██    ██
@@ -1055,6 +1129,8 @@ EPCError epc_server_close(EPCServer server) {
 //  ██████ ███████ ██ ███████ ██   ████    ██
 
 EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms) {
+    uint64_t last_time = monotonic_time_ms();
+
     EPCError err = EPC_OK;
     EPCError err_cleanup = EPC_OK;
 
@@ -1113,6 +1189,11 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms) 
 #undef CLEANUP
 #define CLEANUP cleanup_join_lock_locked
 
+    if (update_timeout(&last_time, &timeout_ms)) {
+        err = error(IPC, TIMEOUT);
+        goto CLEANUP;
+    }
+
     // Open the server event semaphore used to signal a join event to the server.
     err = build_internal_obj_name(
         &(BuildNameParams){.name = name_str, .object_type_str = epc_prefix_server_sem},
@@ -1154,29 +1235,51 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms) 
 
     // Connect to server.
     volatile JoinArea *join_area = (volatile JoinArea *)join_shmem.buf;
+
     // TODO: this behaviour will result in a failure despite the timeout.
     // ie. the timeout accounts for busy servers, not non-existing servers.
+    // Need to use backoff timeout polling here.
     if (!join_area->server_alive) {
         err = error(IPC, COULD_NOT_CONNECT);
         goto CLEANUP;
     }
 
-    // Request an ID.
-    join_area->counter++;
+    if (memcmp(join_area->magic_string, EPICAC_HEADER, sizeof EPICAC_HEADER)) {
+        err = error(IPC, COULD_NOT_CONNECT);
+        goto CLEANUP;
+    }
 
-    // Signal the server.
+    // Request an ID.
+    join_area->server_ready = false;
+
+    // Wake up the server.
     if ((err = post_semaphore(ptr->server_event_sem)).high)
         goto CLEANUP;
 
     // Wait for the server to assign an ID.
-    if ((err = wait_semaphore(join_sem, timeout_ms)).high)
-        goto CLEANUP;
+    // To exit this loop, 1 of the following must hold:
+    // 1. An error occured while trying to wait on the semaphore.
+    // 2. The timeout has been exceeded.
+    // 3. The server has indicated that its finished necessary initialization.
+    while (true) {
+        err = wait_semaphore(join_sem, timeout_ms);
+        if (err.high)
+            goto CLEANUP;
 
-    close_semaphore(join_sem);
+        if (update_timeout(&last_time, &timeout_ms)) {
+            err = error(IPC, TIMEOUT);
+            goto CLEANUP;
+        }
+
+        if (join_area->server_ready) {
+            break;
+        }
+    }
 
     ptr->connection.id = join_area->fixed_id;
     ptr->connection.dynamic_id = 0;
     ptr->connection.last_response_time_ms = monotonic_time_ms();
+    ptr->connection.other_side_initialized = false;
 
     ptr->connection.shmem.size = join_area->initial_size;
 
@@ -1205,10 +1308,25 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms) 
     if ((err = open_shmem(&ptr->connection.shmem, str, NULL)).high)
         goto CLEANUP;
 
+    // Initialize internal state.
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
+    shared->client.turn = TURN_SENDER;
+    shared->client.buffer_size = initial_size_of_buffer(ptr->connection.shmem.size);
+    shared->client.message_size = 0;
+    shared->client.ptr =
+        shared->buf + get_ptrdiff_from_side(SIDE_CLIENT, shared->client.buffer_size,
+                                            ptr->connection.shmem.size);
+
+    // Indicate to server that the client area has been initialized.
+    memcpy(shared->client.magic_string, EPICAC_HEADER, sizeof EPICAC_HEADER);
+
+    join_area->client_ready = true;
+
     ptr->initialized = INITIALIZED_CANARY;
     client->internal = ptr;
 
-    // Release the mutex.
+    // Release the mutex and close the join semaphore.
+    close_semaphore(join_sem);
     release_mutex(join_lock);
     close_mutex(join_lock);
 

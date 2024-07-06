@@ -65,7 +65,9 @@ typedef enum EPCErrorHigh {
 typedef enum EPCErrorLow {
     EPC_ERR_L_NONE = 0x0,
 
-    EPC_ERR_L_TIMEOUT = 0x1,
+    EPC_ERR_L_NOTHING_TO_DO,
+
+    EPC_ERR_L_TIMEOUT,
 
     EPC_ERR_L_NOT_INITIALIZED,
     EPC_ERR_L_IS_NULL,
