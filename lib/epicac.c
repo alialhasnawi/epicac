@@ -1,12 +1,9 @@
-// Add better error checking.
-
 // STRING CONVENTION : All strings should include their length.
 // All strings should be null-terminated.
 
 // The IPC works off of a synchronous turn based model, backed by a shared memory buffer.
 // The buffer is large enough to store an entire message. If this is not the case,
-// the server and client can request for this to be changed. To accomplish this, a new
-// shared memory object is created.
+// the calling code can manually concatenate messages.
 //
 // To connect to a server, a client makes a request by modifying a shared memory buffer
 // `JoinArea`. The server responds by assigning a client ID. While this is happening, the
@@ -17,6 +14,11 @@
 // - Each client has 1 semaphore to handle signals from the server (turn change).
 // - Client share 1 mutex to handle joining the server, to prevent concurrent
 //   writes to the join shared memory area.
+// - A server holds a mutex to prevent another process from listening in on the
+//   address.
+
+// TODO: test on Linux
+// TODO: ensure setting a timeout of 0 works as expected
 
 #include "epicac.h"
 
@@ -43,17 +45,66 @@
 static_assert((EPC_ERR_H_COUNT) < UINT8_MAX, "Error codes must fit in 1 byte.");
 static_assert(EPC_ERR_L_COUNT < UINT8_MAX, "Error code details must fit in 1 byte.");
 
-static inline EPCError error(EPCErrorHigh err_high, EPCErrorLow err_low) {
+static inline EPCError error_(EPCErrorHigh err_high, EPCErrorLow err_low) {
     // return (err_high << 8) | err_low;
     return (EPCError){err_high, err_low};
 }
 
 static_assert(sizeof(EPCError) == 2, "EPCError contains no padding.");
 
-#define error(high, low) error(EPC_ERR_H_##high, EPC_ERR_L_##low)
+#define error(high, low) error_(EPC_ERR_H_##high, EPC_ERR_L_##low)
 
 static inline bool err_eq(EPCError x, EPCError y) {
     return x.high == y.high && x.low == y.low;
+}
+
+const char *epc_error_low_str(EPCError error) {
+    switch (error.low) {
+#define X(name, string, description)                                                     \
+    case EPC_ERR_L_##name:                                                               \
+        return string;
+
+        ERROR_LOW
+#undef X
+    default:
+        return "Invalid error";
+    }
+}
+const char *epc_error_low_description(EPCError error) {
+    switch (error.low) {
+#define X(name, string, description)                                                     \
+    case EPC_ERR_L_##name:                                                               \
+        return description;
+
+        ERROR_LOW
+#undef X
+    default:
+        return "Invalid error";
+    }
+}
+const char *epc_error_high_str(EPCError error) {
+    switch (error.high) {
+#define X(name, string, description)                                                     \
+    case EPC_ERR_H_##name:                                                               \
+        return string;
+
+        ERROR_HIGH
+#undef X
+    default:
+        return "Invalid error";
+    }
+}
+const char *epc_error_high_description(EPCError error) {
+    switch (error.high) {
+#define X(name, string, description)                                                     \
+    case EPC_ERR_H_##name:                                                               \
+        return description;
+
+        ERROR_HIGH
+#undef X
+    default:
+        return "Invalid error";
+    }
 }
 
 // Compiler specific config.
@@ -73,8 +124,8 @@ static inline bool err_eq(EPCError x, EPCError y) {
 #define STRING(x) STRING_(x)
 
 // Version string is 12 hexadecimal characters or 6 bytes (major-minor-patch).
-#define EPC_MIN_COMPAT_VERSION 000000000000
-#define EPC_VERSION 000000000000
+#define EPC_MIN_COMPAT_VERSION 000000000001
+#define EPC_VERSION 000000000001
 #define EPC_VERSION_STRING STRING(EPC_VERSION)
 #define EPC_VERSION_VALUE HEX(EPC_VERSION)
 #define EPC_MIN_COMPAT_VERSION_VALUE HEX(EPC_MIN_COMPAT_VERSION)
@@ -91,7 +142,7 @@ typedef struct EPCHeader {
 static_assert(sizeof(EPCHeader) == 24, "EPCHeader contains no padding.");
 
 // Header modelled after PNG header. Allows easier viewing in hex editors.
-const EPCHeader EPC_HEADER = {.first_byte = '\x8F',          // High bit byte.
+const EPCHeader EPC_HEADER = {.first_byte = "\x8F",          // High bit byte.
                               .protocol = "EPICACv",         // Protocol identifier.
                               .version = EPC_VERSION_VALUE,  // Version identifier.
                               .win_line_terminator = "\r\n", // Windows line terminator.
@@ -222,7 +273,7 @@ typedef struct BuildNameParams {
     String name;
     const char(*object_type_str);
     uint32_t fixed_id;
-    uint32_t rand_id;
+    uint32_t dynamic_id;
 } BuildNameParams;
 static EPCError build_internal_obj_name(BuildNameParams *params, String *string,
                                         char *buf, size_t bufsize) {
@@ -237,7 +288,7 @@ static EPCError build_internal_obj_name(BuildNameParams *params, String *string,
     start += cat(buf, start, EPC_OBJECT_TYPE_LEN, (const char *)params->object_type_str);
     base64_encode(params->fixed_id, b64_scratch);
     start += cat(buf, start, EPC_FIXED_ID_LEN, b64_scratch);
-    base64_encode(params->rand_id, b64_scratch);
+    base64_encode(params->dynamic_id, b64_scratch);
     start += cat(buf, start, EPC_FIXED_ID_LEN, b64_scratch);
     start += cat(buf, start, params->name.len, params->name.bytes);
     start += cat(buf, start, 1, "\0");
@@ -249,8 +300,6 @@ static EPCError build_internal_obj_name(BuildNameParams *params, String *string,
 }
 
 #ifdef EPC_WINDOWS
-
-/// TODO: check if this is threadsafe
 
 /// @brief Scratch buffer for converting UTF-8 to `WCHAR` for Windows calls.
 /// While only at most `EPC_MAX_SHMEM_NAME` `WCHAR`s are needed to convert to UTF-16,
@@ -626,7 +675,9 @@ static EPCError destroy_mutex(Mutex mutex, const char *name) {
 
 static EPCError wait_mutex(Mutex mutex, uint32_t timeout_ms) {
 #ifdef EPC_WINDOWS
+    SetLastError(0);
     DWORD status = WaitForSingleObject(mutex, timeout_ms);
+
     switch (status) {
     case WAIT_OBJECT_0:
     case WAIT_ABANDONED:
@@ -764,7 +815,7 @@ static EPCError release_mutex(Mutex mutex) {
 
 typedef struct ClientConnection {
     uint32_t id;
-    uint32_t rand_id;
+    uint32_t dynamic_id;
     ShmemBuffer shmem;
     Semaphore client_sem;
     uint64_t last_response_time_ms;
@@ -789,7 +840,7 @@ EPCError BitArray_new(BitArray *array, uint32_t initial_size) {
     if ((err = Array_U8_new(&array->array, byte_size)).high)
         return err;
 
-    for (int32_t i; i < array->array.len; i++) {
+    for (uint32_t i = 0; i < array->array.len; i++) {
         array->array.slice[i] = 0x00;
     }
 
@@ -883,17 +934,18 @@ typedef struct JoinArea {
 } JoinArea;
 
 typedef enum SharedTurn {
-    TURN_SENDER = 0x00,
-    TURN_RECEIVER = 0x01,
-    TURN_CLOSE = 0x80,
-    TURN_ERROR = 0xFF,
+    TURN_SENDER =
+        0x00, // This buffer can be written to; a message may be partially written.
+    TURN_RECEIVER =
+        0x01, // This buffer can be read from; a message has been completely written.
+    TURN_CLOSE = 0x80, // The owner of this buffer has closed the connection.
+    TURN_ERROR =
+        0xFF, // The owner of this buffer has closed the connection due to an error.
 } SharedTurn;
 
 typedef struct SharedBufferHeader {
     uint8_t turn;        // Whether this buffer should be written to or not.
     size_t message_size; // Size of most recent message OR new size to upgrade to.
-    uint8_t *ptr;        // Pointer to start of message.
-    uint32_t canary;
 } SharedBufferHeader;
 
 typedef struct SharedBuffer {
@@ -902,18 +954,20 @@ typedef struct SharedBuffer {
     uint8_t buf[];
 } SharedBuffer;
 
+static inline ptrdiff_t get_server_offset(ClientConnection *connection) {
+    (void)connection;
+    return 0;
+}
+
+static inline ptrdiff_t get_client_offset(ClientConnection *connection) {
+    return connection->server_buf_size;
+}
+
 static const uint32_t INITIALIZED_CANARY = 0x12345678;
-
-// TODO: config for sever and client setup.
-
-typedef struct ServerSettings {
-    uint32_t initial_message_size;
-} ServerSettings;
-
-ServerSettings SERVER_SETTINGS_DEFAULT = {.initial_message_size = 128};
 
 typedef struct Server {
     Array_ClientConnection clients;
+    int32_t next_serve_index; // A value of -1 should only happen if clients.len == 0
     BitArray client_ids;
     Semaphore server_event_sem;
 
@@ -921,8 +975,6 @@ typedef struct Server {
 
     Mutex join_mutex;
     ShmemBuffer join_shmem;
-
-    ServerSettings settings;
 
     uint32_t initialized;
     uint16_t name_len;
@@ -1013,11 +1065,14 @@ uint8_t get_next_backoff_stage(uint8_t current_backoff_stage) {
     default:
         assert("Poll stage is invalid, maybe not initialized." && false);
     }
+    return 0xff;
 }
 
 void backoff_timeout(uint32_t timeout_ms, BackoffTimeout *backoff) {
+    if (timeout_ms == 0)
+        return;
+
     if (backoff->stage == POLL_STAGE_SPIN) {
-        // TODO: Make sure this doesn't get optimized out.
         for (volatile int i = 0; i < 1000; ++i)
             ;
     } else if (backoff->stage == POLL_STAGE_15MS) {
@@ -1035,10 +1090,13 @@ void backoff_timeout(uint32_t timeout_ms, BackoffTimeout *backoff) {
     }
 }
 
-typedef enum EPCSide {
-    SIDE_SERVER = 0x0,
-    SIDE_CLIENT = 0x1,
-} EPCSide;
+#if defined(_MSC_VER)
+#define MEMORY_BARRIER MemoryBarrier()
+#elif defined(__GNUC__) || defined(__clang__)
+#define MEMORY_BARRIER __sync_synchronize()
+#else
+#error "Compiler does not support memory fence/barrier."
+#endif
 
 // ███████ ███████ ██████  ██    ██ ███████ ██████
 // ██      ██      ██   ██ ██    ██ ██      ██   ██
@@ -1070,8 +1128,6 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
         goto CLEANUP;
     }
 
-    ptr->settings = SERVER_SETTINGS_DEFAULT;
-
 #undef CLEANUP
 #define CLEANUP cleanup_server_alloced
 
@@ -1096,7 +1152,7 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
 #undef CLEANUP
 #define CLEANUP cleanup_addr_mutex_opened
 
-    if ((err = wait_mutex(&ptr->address_mutex, timeout_ms)).high) {
+    if ((err = wait_mutex(ptr->address_mutex, timeout_ms)).high) {
         if (err.low == EPC_ERR_L_TIMEOUT)
             err = error(IPC, ALREADY_OPEN);
         goto CLEANUP;
@@ -1108,6 +1164,7 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
     // Initialize client array list.
     if ((err = Array_ClientConnection_new(&ptr->clients, 8)).high)
         goto CLEANUP;
+    ptr->next_serve_index = -1;
 
 #undef CLEANUP
 #define CLEANUP cleanup_client_array_alloced
@@ -1138,7 +1195,6 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
     if (err.high)
         goto CLEANUP;
 
-    printf("shmem name is '%s'\n", str.bytes);
     ptr->join_shmem = (ShmemBuffer){.size = sizeof(JoinArea)};
     if ((err = open_shmem(&ptr->join_shmem, str, sizeof(JoinArea), NULL)).high)
         goto CLEANUP;
@@ -1149,8 +1205,9 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
     volatile JoinArea *join_area = (volatile JoinArea *)ptr->join_shmem.buf;
 
     if (join_area->server_alive == true) {
-        err = error(IPC, ALREADY_OPEN);
-        goto CLEANUP;
+        // This is only possible if the previous server crashed.
+        // err = error(IPC, ALREADY_OPEN);
+        // goto CLEANUP;
     }
 
     err = build_internal_obj_name(
@@ -1179,7 +1236,7 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
     return err;
 
     // Error cleanup.
-cleanup_join_mutex_opened:
+    // cleanup_join_mutex_opened:
     close_mutex(ptr->join_mutex);
 #ifdef EPC_POSIX
     err_cleanup = build_internal_obj_name(
@@ -1223,13 +1280,235 @@ cleanup_nothing:
     return err;
 }
 
+uint32_t id32() {
+    static uint32_t last_num = 0;
+    return last_num++;
+}
+
+static inline EPCClientID id_from_connection(ClientConnection *connection) {
+    return (EPCClientID){(((uint64_t)connection->id) << 32) | connection->dynamic_id};
+}
+
+static inline int32_t connection_index_from_id(Array_ClientConnection *clients,
+                                               EPCClientID id) {
+    for (uint32_t i = 0; i < clients->len; ++i) {
+        if (id_from_connection(&clients->slice[i]).id == id.id)
+            return i;
+    }
+    return -1;
+}
+
+static EPCError epc_server_accept(Server *ptr, EPCClientID *client_id,
+                                  uint32_t timeout_ms, uint32_t requested_size) {
+    uint64_t last_time = monotonic_time_ms();
+
+    EPCError err = EPC_OK;
+    EPCError err_cleanup = EPC_OK;
+
+    String name_str = {.len = ptr->name_len, .bytes = ptr->name};
+    String str = {0};
+
+    volatile JoinArea *join_area = (volatile JoinArea *)ptr->join_shmem.buf;
+
+    if (!join_area->client_waiting) {
+        return error(OK, NOTHING_TO_DO);
+    }
+    MEMORY_BARRIER;
+    join_area->client_waiting = false;
+
+#undef CLEANUP
+#define CLEANUP cleanup_client_exists
+
+    // A client wants to join. Check compatibility then set system resources up.
+    EPCHeader client_header = join_area->client_header;
+    if ((err = check_compatibility(&client_header)).high) {
+        goto CLEANUP;
+    }
+
+    if (join_area->client_size == 0) {
+        err = error(IPC, INVALID_MESSAGE_SIZE);
+        goto CLEANUP;
+    }
+
+    ClientConnection connection = {0};
+
+    if ((err = BitArray_get_new_bit(&ptr->client_ids, &connection.id)).high)
+        goto CLEANUP;
+
+    connection.dynamic_id = id32();
+
+#undef CLEANUP
+#define CLEANUP cleanup_id_alloced
+
+    connection.server_buf_size = requested_size ? requested_size : get_page_size();
+    connection.client_buf_size = join_area->client_size;
+    connection.last_response_time_ms = monotonic_time_ms();
+
+    size_t shmem_size =
+        sizeof(SharedBuffer) + connection.server_buf_size + connection.client_buf_size;
+
+    // Open new shared memory and semaphore.
+    err = build_internal_obj_name(
+        &(BuildNameParams){.name = name_str,
+                           .object_type_str = epc_prefix_client_sem,
+                           .fixed_id = connection.id},
+        &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
+    if (err.high)
+        goto CLEANUP;
+    if ((err = open_semaphore(&connection.client_sem, str)).high)
+        goto CLEANUP;
+
+#undef CLEANUP
+#define CLEANUP cleanup_client_sem_opened
+
+    err = build_internal_obj_name(
+        &(BuildNameParams){
+            .name = name_str,
+            .object_type_str = epc_prefix_shmem,
+            .fixed_id = connection.id,
+            .dynamic_id = connection.dynamic_id,
+        },
+        &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
+    if (err.high)
+        goto CLEANUP;
+    if ((err = open_shmem(&connection.shmem, str, shmem_size, NULL)).high)
+        goto CLEANUP;
+
+#undef CLEANUP
+#define CLEANUP cleanup_message_shmem_opened
+
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)connection.shmem.buf;
+
+    shared->server = (SharedBufferHeader){
+        .turn = TURN_SENDER,
+        .message_size = 0,
+    };
+    shared->client = (SharedBufferHeader){
+        .turn = TURN_SENDER,
+        .message_size = 0,
+    };
+
+    // Signal client to finish initialization.
+    join_area->server_size = connection.server_buf_size;
+    join_area->shmem_size = shmem_size;
+    join_area->fixed_id = connection.id;
+    join_area->client_ready = false;
+    MEMORY_BARRIER;
+    join_area->server_ready = true;
+
+    // Wait for client to finish their part of initialization.
+    // To exit this loop, 1 of the following must hold:
+    // 1. The timeout has been exceeded.
+    // 2. The client has aborted the operation.
+    // 3. The client has indicated that its finished necessary initialization.
+    BackoffTimeout backoff = {0};
+
+    while (true) {
+        if (join_area->client_ready) {
+            break;
+        }
+        if (join_area->abort) {
+            err = error(IPC, CLIENT);
+            goto CLEANUP;
+        }
+        backoff_timeout(timeout_ms, &backoff);
+
+        if (update_timeout(&last_time, &timeout_ms)) {
+            err = error(IPC, TIMEOUT);
+            goto CLEANUP;
+        }
+    }
+
+    if ((err = Array_ClientConnection_append(&ptr->clients, connection)).high)
+        goto CLEANUP;
+
+    if (client_id != NULL) {
+        *client_id = id_from_connection(&connection);
+    }
+
+    return err;
+
+cleanup_message_shmem_opened:
+    close_shmem(connection.shmem);
+#ifdef EPC_POSIX
+    err_cleanup =
+        build_internal_obj_name(&(BuildNameParams){.name = name_str,
+                                                   .object_type_str = epc_prefix_shmem,
+                                                   .fixed_id = connection.id,
+                                                   .dynamic_id = connection.dynamic_id},
+                                &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
+    if (!err_cleanup.high) {
+        destroy_shmem(str.bytes);
+    }
+#endif
+cleanup_client_sem_opened:
+    close_semaphore(connection.client_sem);
+#ifdef EPC_POSIX
+    err_cleanup = build_internal_obj_name(
+        &(BuildNameParams){.name = name_str,
+                           .object_type_str = epc_prefix_client_sem,
+                           .fixed_id = connection.id},
+        &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
+    if (!err_cleanup)
+        destroy_semaphore(str.bytes);
+#endif
+cleanup_id_alloced:
+    BitArray_unset_bit_unchecked(&ptr->client_ids, connection.id);
+cleanup_client_exists:
+    join_area->abort = true;
+
+    return err;
+}
+
+static EPCError epc_server_disconnect_client(Server *ptr, uint32_t index,
+                                             SharedTurn turn) {
+    EPCError err = EPC_OK;
+    EPCError err_cleanup = EPC_OK;
+    String name_str = {.len = ptr->name_len, .bytes = ptr->name};
+    String str = {0};
+
+    ClientConnection connection = {0};
+    if ((err = Array_ClientConnection_at_checked(&ptr->clients, &connection, index)).high)
+        return err;
+
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)connection.shmem.buf;
+
+    // Indicate to client the server's intention to close the connection.
+    shared->server.turn = turn;
+
+    close_shmem(connection.shmem);
+#ifdef EPC_POSIX
+    err_cleanup =
+        build_internal_obj_name(&(BuildNameParams){.name = name_str,
+                                                   .object_type_str = epc_prefix_shmem,
+                                                   .fixed_id = connection.id,
+                                                   .dynamic_id = connection.dynamic_id},
+                                &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
+    if (!err_cleanup.high) {
+        destroy_shmem(str.bytes);
+    }
+#endif
+    close_semaphore(connection.client_sem);
+#ifdef EPC_POSIX
+    err_cleanup = build_internal_obj_name(
+        &(BuildNameParams){.name = name_str,
+                           .object_type_str = epc_prefix_client_sem,
+                           .fixed_id = connection.id},
+        &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
+    if (!err_cleanup)
+        destroy_semaphore(str.bytes);
+#endif
+    BitArray_unset_bit_unchecked(&ptr->client_ids, index);
+    Array_ClientConnection_delete_ordered(&ptr->clients, index);
+
+    return EPC_OK;
+}
+
 EPCError epc_server_close(EPCServer *server) {
     String str = {0};
     EPCError err = EPC_OK;
 
     Server *ptr = server->internal;
-
-    // TODO: close all client connections
 
     if (ptr == NULL)
         return error(ARGS, IS_NULL);
@@ -1240,7 +1519,13 @@ EPCError epc_server_close(EPCServer *server) {
     // Let clients know that the server is not alive.
     ((volatile JoinArea *)ptr->join_shmem.buf)->server_alive = false;
 
-    // This resource cleanup should be done in the same way everywhere it's needed.
+    // Close all client connections.
+    Array_ClientConnection *clients = &ptr->clients;
+    for (int64_t i = clients->len - 1; i >= 0; --i) {
+        // This should never fail.
+        epc_server_disconnect_client(ptr, i, TURN_CLOSE);
+    }
+
     // Close system resources.
 
     close_mutex(ptr->join_mutex);
@@ -1285,195 +1570,193 @@ EPCError epc_server_close(EPCServer *server) {
     return EPC_OK;
 }
 
-uint32_t rand32() {
-    // TODO: once you have internet access again.
-    return 0;
-}
-
-EPCError epc_server_accept(EPCServer server, uint32_t timeout_ms,
-                           uint32_t requested_size) {
-    uint64_t last_time = monotonic_time_ms();
-
+EPCError epc_server_try_recv_or_accept(EPCServer server,
+                                       EPC_OPTIONAL EPCClientID *client_id,
+                                       EPCMessage *message, uint32_t requested_size,
+                                       uint32_t timeout_ms) {
     EPCError err = EPC_OK;
-    EPCError err_cleanup = EPC_OK;
-    Server *ptr = (Server *)server.internal;
+    Server *ptr = server.internal;
+    if (ptr->initialized != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
+    // This will be 0 on the first iteration, and non-zero otherwise.
+    uint64_t last_time = 0;
 
-    String name_str = {.len = ptr->name_len, .bytes = ptr->name};
-    String str = {0};
-
-    volatile JoinArea *join_area = (volatile JoinArea *)ptr->join_shmem.buf;
-
-    if (!join_area->client_waiting) {
-        return EPC_OK;
-    }
-    join_area->client_waiting = false;
-
-#undef CLEANUP
-#define CLEANUP cleanup_client_exists
-
-    // A client wants to join. Check compatibility then set system resources up.
-    if ((err = check_compatibility(&join_area->client_header)).high) {
-        goto CLEANUP;
-    }
-
-    if (join_area->client_size == 0) {
-        err = error(IPC, INVALID_MESSAGE_SIZE);
-        goto CLEANUP;
-    }
-
-    ClientConnection connection = {0};
-
-    if ((err = BitArray_get_new_bit(&ptr->client_ids, &connection.id)).high)
-        goto CLEANUP;
-
-    connection.rand_id = rand32();
-
-#undef CLEANUP
-#define CLEANUP cleanup_id_alloced
-
-    connection.server_buf_size = requested_size ? requested_size : get_page_size();
-    connection.client_buf_size = join_area->client_size;
-    connection.last_response_time_ms = monotonic_time_ms();
-
-    size_t shmem_size =
-        sizeof(SharedBuffer) + connection.server_buf_size + connection.client_buf_size;
-
-    // Open new shared memory and semaphore.
-    err = build_internal_obj_name(
-        &(BuildNameParams){.name = name_str,
-                           .object_type_str = epc_prefix_client_sem,
-                           .fixed_id = connection.id},
-        &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (err.high)
-        goto CLEANUP;
-    if ((err = open_semaphore(&connection.client_sem, str)).high)
-        goto CLEANUP;
-
-#undef CLEANUP
-#define CLEANUP cleanup_client_sem_opened
-
-    err = build_internal_obj_name(
-        &(BuildNameParams){
-            .name = name_str,
-            .object_type_str = epc_prefix_shmem,
-            .fixed_id = connection.id,
-            .rand_id = connection.rand_id,
-        },
-        &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (err.high)
-        goto CLEANUP;
-    if ((err = open_shmem(&connection.shmem, str, shmem_size, NULL)).high)
-        goto CLEANUP;
-
-#undef CLEANUP
-#define CLEANUP cleanup_message_shmem_opened
-
-    volatile SharedBuffer *shared = (volatile SharedBuffer *)connection.shmem.buf;
-
-    shared->server = (SharedBufferHeader){.turn = TURN_SENDER,
-                                          .message_size = 0,
-                                          .ptr = shared->buf,
-                                          .canary = INITIALIZED_CANARY};
-    shared->client = (SharedBufferHeader){.turn = TURN_SENDER,
-                                          .message_size = 0,
-                                          .ptr = shared->buf + connection.server_buf_size,
-                                          .canary = INITIALIZED_CANARY};
-
-    // Signal client to finish initialization.
-    join_area->server_size = connection.server_buf_size;
-    join_area->shmem_size = shmem_size;
-    join_area->fixed_id = connection.id;
-    join_area->client_ready = false;
-    join_area->server_ready = true;
-
-    // Wait for client to finish their part of initialization.
-    // To exit this loop, 1 of the following must hold:
-    // 1. The timeout has been exceeded.
-    // 2. The client has aborted the operation.
-    // 3. The client has indicated that its finished necessary initialization.
-    BackoffTimeout backoff = {0};
+    Array_ClientConnection *connections = &ptr->clients;
 
     while (true) {
-        if (join_area->client_ready) {
-            break;
+        // Accept incoming clients.
+        err = epc_server_accept(ptr, client_id, timeout_ms, requested_size);
+        if (err.high) {
+            return err;
         }
-        if (join_area->abort) {
-            err = error(IPC, CLIENT);
-            goto CLEANUP;
+        if (err.low != EPC_ERR_L_NOTHING_TO_DO) {
+            *message = (EPCMessage){.buf = NULL, .len = 0};
+            // Set next_serve_index if this new client is the only one.
+            if (ptr->next_serve_index == -1)
+                ptr->next_serve_index = 0;
+            return error(OK, ACCEPTED);
         }
-        backoff_timeout(timeout_ms, &backoff);
 
-        if (update_timeout(&last_time, &timeout_ms)) {
-            err = error(IPC, TIMEOUT);
-            goto CLEANUP;
+        // Iterate backwards through all currently connected clients.
+        for (int32_t i = ptr->next_serve_index; i >= 0; --i) {
+            ClientConnection *connection = &connections->slice[i];
+            volatile SharedBuffer *shared =
+                (volatile SharedBuffer *)connection->shmem.buf;
+            uint8_t client_turn = shared->client.turn;
+
+            // Kill error/client-side killed connections.
+            if (client_turn == TURN_CLOSE || client_turn == TURN_ERROR) {
+                epc_server_disconnect_client(ptr, i, client_turn);
+            }
+
+            // Handle incoming messages.
+            else if (client_turn == TURN_RECEIVER) {
+                MEMORY_BARRIER;
+                *message =
+                    (EPCMessage){.len = shared->client.message_size,
+                                 .buf = shared->buf + get_client_offset(connection)};
+                // Either way, next_serve_index >= 0 after this.
+                if (i <= 0) {
+                    ptr->next_serve_index = (int32_t)(connections->len & INT32_MAX) - 1;
+                } else {
+                    ptr->next_serve_index = i - 1;
+                }
+                return error(OK, GOT_MESSAGE);
+            }
+        }
+        ptr->next_serve_index = connections->len - 1;
+
+        if (!last_time) {
+            last_time = monotonic_time_ms();
+        } else if (update_timeout(&last_time, &timeout_ms)) {
+            return error(IPC, TIMEOUT);
+        }
+
+        err = wait_semaphore(ptr->server_event_sem, timeout_ms);
+        if (err.low == EPC_ERR_L_SEM) {
+            err.high = EPC_ERR_H_IPC;
+            return err; // Keep low error details.
         }
     }
-
-    if ((err = Array_ClientConnection_append(&ptr->clients, connection)).high)
-        goto CLEANUP;
-
-    return err;
-
-cleanup_message_shmem_opened:
-    close_shmem(connection.shmem);
-#ifdef EPC_POSIX
-    err_cleanup =
-        build_internal_obj_name(&(BuildNameParams){.name = name_str,
-                                                   .object_type_str = epc_prefix_shmem,
-                                                   .fixed_id = connection.id,
-                                                   .rand_id = connection.rand_id},
-                                &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (!err_cleanup.high) {
-        destroy_shmem(str.bytes);
-    }
-#endif
-cleanup_client_sem_opened:
-    close_semaphore(connection.client_sem);
-#ifdef EPC_POSIX
-    err_cleanup = build_internal_obj_name(
-        &(BuildNameParams){.name = name_str,
-                           .object_type_str = epc_prefix_client_sem,
-                           .fixed_id = connection.id},
-        &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (!err_cleanup)
-        destroy_semaphore(str.bytes);
-#endif
-cleanup_id_alloced:
-    BitArray_unset_bit_unchecked(&ptr->client_ids, connection.id);
-cleanup_client_exists:
-    join_area->abort = true;
-
-    return err;
 }
 
-EPCError epc_server_disconnect_client(Server *ptr, uint32_t index) {
+EPCError epc_server_end_recv(EPCServer server, EPCClientID client_id) {
     EPCError err = EPC_OK;
-    EPCError err_cleanup = EPC_OK;
-    String name_str = {.len = ptr->name_len, .bytes = ptr->name};
-    String str = {0};
+    Server *ptr = server.internal;
+    if (ptr->initialized != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
 
-    ClientConnection connection = {0};
-    if ((err = Array_ClientConnection_at_checked(&ptr->clients, &connection, index)).high)
-        return err;
-
-    volatile SharedBuffer *shared = (volatile SharedBuffer *)connection.shmem.buf;
-
-    shared->server.turn = TURN_CLOSE;
-
-    close_shmem(connection.shmem);
-#ifdef EPC_POSIX
-    err_cleanup =
-        build_internal_obj_name(&(BuildNameParams){.name = name_str,
-                                                   .object_type_str = epc_prefix_shmem,
-                                                   .fixed_id = connection.id,
-                                                   .rand_id = connection.rand_id},
-                                &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (!err_cleanup.high) {
-        destroy_shmem(str.bytes);
+    int32_t connection_index = connection_index_from_id(&ptr->clients, client_id);
+    if (connection_index == -1) {
+        return error(ARGS, ID);
     }
-#endif
+    ClientConnection *connection = &ptr->clients.slice[connection_index];
 
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)connection->shmem.buf;
 
+    switch (shared->client.turn) {
+    case TURN_RECEIVER:
+        MEMORY_BARRIER;
+        shared->client.turn = TURN_SENDER;
+        return EPC_OK;
+    case TURN_SENDER:
+        return error(IPC, OUT_OF_ORDER);
+
+    case TURN_CLOSE:
+        return error(IPC, CLOSED);
+    case TURN_ERROR:
+        return error(IPC, CLIENT);
+    default:
+        return error(IPC, ENUM);
+    }
+}
+
+EPCError epc_server_try_send(EPCServer server, EPCClientID client_id, EPCBuffer *buf,
+                             uint32_t timeout_ms) {
+    EPCError err = EPC_OK;
+    Server *ptr = server.internal;
+
+    if (ptr->initialized != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
+
+    int32_t connection_index = connection_index_from_id(&ptr->clients, client_id);
+    if (connection_index == -1) {
+        return error(ARGS, ID);
+    }
+    ClientConnection *connection = &ptr->clients.slice[connection_index];
+
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)connection->shmem.buf;
+    uint64_t last_time = 0;
+    BackoffTimeout backoff = (BackoffTimeout){0};
+
+    while (true) {
+        switch (shared->server.turn) {
+        case TURN_RECEIVER:
+            backoff_timeout(timeout_ms, &backoff);
+
+            if (!last_time) {
+                last_time = monotonic_time_ms();
+            } else if (update_timeout(&last_time, &timeout_ms)) {
+                return error(IPC, TIMEOUT);
+            }
+            break;
+
+        case TURN_SENDER:
+            goto ready;
+
+        case TURN_CLOSE:
+            return error(IPC, CLOSED);
+        case TURN_ERROR:
+            return error(IPC, CLIENT);
+        default:
+            return error(IPC, ENUM);
+        }
+    }
+
+ready:
+    // By now, server.turn must be TURN_SENDER.
+    buf->buf = shared->buf + get_server_offset(connection);
+    buf->size = connection->server_buf_size;
+
+    return EPC_OK;
+}
+
+EPCError epc_server_end_send(EPCServer server, EPCClientID client_id,
+                             uint32_t message_size) {
+    EPCError err = EPC_OK;
+    Server *ptr = server.internal;
+
+    if (ptr->initialized != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
+
+    int32_t connection_index = connection_index_from_id(&ptr->clients, client_id);
+    if (connection_index == -1) {
+        return error(ARGS, ID);
+    }
+    ClientConnection *connection = &ptr->clients.slice[connection_index];
+    if (message_size > connection->server_buf_size)
+        return error(ARGS, MESSAGE_TOO_LARGE);
+
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)connection->shmem.buf;
+
+    switch (shared->server.turn) {
+    case TURN_SENDER:
+        shared->server.message_size = message_size;
+        MEMORY_BARRIER;
+        shared->server.turn = TURN_RECEIVER;
+        // NOTE: Unchecked error.
+        post_semaphore(connection->client_sem);
+        return EPC_OK;
+    case TURN_RECEIVER:
+        return error(IPC, OUT_OF_ORDER);
+
+    case TURN_CLOSE:
+        return error(IPC, CLOSED);
+    case TURN_ERROR:
+        return error(IPC, CLIENT);
+    default:
+        return error(IPC, ENUM);
+    }
 }
 
 //  ██████ ██      ██ ███████ ███    ██ ████████
@@ -1482,8 +1765,8 @@ EPCError epc_server_disconnect_client(Server *ptr, uint32_t index) {
 // ██      ██      ██ ██      ██  ██ ██    ██
 //  ██████ ███████ ██ ███████ ██   ████    ██
 
-EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms,
-                            uint32_t requested_size) {
+EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_size,
+                            uint32_t timeout_ms) {
     uint64_t last_time = monotonic_time_ms();
 
     EPCError err = EPC_OK;
@@ -1537,7 +1820,7 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms,
     // Lock the join waiting area mutex.
     if ((err = wait_mutex(join_lock, timeout_ms)).high) {
         if (err.low == EPC_ERR_L_TIMEOUT)
-            err = error(IPC, ALREADY_OPEN);
+            err = error(IPC, TIMEOUT);
         goto CLEANUP;
     }
 
@@ -1591,16 +1874,20 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms,
         }
     }
 
+    MEMORY_BARRIER;
+
     // Check header and version compatibility.
-    if ((err = check_compatibility(&join_area->server_header)).high) {
+    EPCHeader server_header = join_area->server_header;
+    if ((err = check_compatibility(&server_header)).high) {
         goto CLEANUP;
     }
 
     // Request an ID.
     join_area->abort = false;
     join_area->client_header = EPC_HEADER;
-    join_area->client_size = requested_size;
+    join_area->client_size = requested_size ? requested_size : get_page_size();
     join_area->server_ready = false;
+    MEMORY_BARRIER;
     join_area->client_waiting = true;
 
 #undef CLEANUP
@@ -1615,7 +1902,7 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms,
     // 1. The timeout has been exceeded.
     // 2. The server has aborted the operation.
     // 3. The server has indicated that its finished necessary initialization.
-    BackoffTimeout backoff = {0};
+    backoff = (BackoffTimeout){0};
 
     while (true) {
         if (join_area->server_ready) {
@@ -1633,10 +1920,12 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms,
         }
     }
 
+    MEMORY_BARRIER;
+
     ptr->connection = (ClientConnection){.client_buf_size = join_area->client_size,
                                          .server_buf_size = join_area->server_size,
                                          .id = join_area->fixed_id,
-                                         .last_response_time_ms = monotonic_time_ns()};
+                                         .last_response_time_ms = monotonic_time_ms()};
     uint64_t shmem_size = join_area->shmem_size;
 
     if (shmem_size != sizeof(SharedBuffer) + ptr->connection.server_buf_size +
@@ -1707,10 +1996,22 @@ cleanup_nothing:
     return err;
 }
 
-EPCError epc_client_disconnect(EPCClient *client) {
-    String str = {0};
-    EPCError err = EPC_OK;
+static void epc_client_disconnect_(Client *client, SharedTurn turn) {
+    // Signal the server of the disconnect.
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)client->connection.shmem.buf;
+    shared->client.turn = turn;
+    post_semaphore(client->server_event_sem);
 
+    // Close the shared memory and server & client semaphores.
+    close_shmem(client->connection.shmem);
+    close_semaphore(client->server_event_sem);
+    close_semaphore(client->connection.client_sem);
+
+    free(client);
+}
+
+EPCError epc_client_disconnect(EPCClient *client) {
+    EPCError err = EPC_OK;
     Client *ptr = client->internal;
 
     if (ptr == NULL)
@@ -1719,19 +2020,149 @@ EPCError epc_client_disconnect(EPCClient *client) {
     if (ptr->initialized != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
 
-    // Signal the server of the disconnect.
-    volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
-    shared->client.turn = TURN_CLOSE;
-    post_semaphore(ptr->server_event_sem);
-
-    // Close the shared memory and server & client semaphores.
-    close_shmem(ptr->connection.shmem);
-    close_semaphore(ptr->server_event_sem);
-    close_semaphore(ptr->connection.client_sem);
-
-    free(ptr);
+    epc_client_disconnect_(ptr, TURN_CLOSE);
 
     client->internal = NULL;
 
     return EPC_OK;
+}
+
+EPCError epc_client_try_recv(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms) {
+    EPCError err = EPC_OK;
+    Client *ptr = client.internal;
+    if (ptr->initialized != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
+    uint64_t last_time = 0;
+
+    while (true) {
+        switch (shared->server.turn) {
+        case TURN_SENDER:
+            if (!last_time) {
+                last_time = monotonic_time_ms();
+            } else if (update_timeout(&last_time, &timeout_ms)) {
+                return error(IPC, TIMEOUT);
+            }
+
+            err = wait_semaphore(ptr->connection.client_sem, timeout_ms);
+            if (err.low == EPC_ERR_L_SEM) {
+                err.high = EPC_ERR_H_IPC;
+                return err; // Keep low error details.
+            }
+            break;
+        case TURN_RECEIVER:
+            goto ready;
+
+        case TURN_CLOSE:
+            return error(IPC, CLOSED);
+        case TURN_ERROR:
+            return error(IPC, SERVER);
+        default:
+            return error(IPC, ENUM);
+        }
+    }
+
+ready:
+    MEMORY_BARRIER;
+
+    // By now, server.turn must be TURN_RECEIVER.
+    // Optional TODO: handle overflows using a canary.
+    // if (shared->server.canary != INITIALIZED_CANARY) {
+    //     return error(IPC, SERVER);
+    // }
+    // shared->server.canary = 0;
+    buf->buf = shared->buf + get_server_offset(&ptr->connection);
+    buf->size = shared->server.message_size;
+
+    return EPC_OK;
+}
+EPCError epc_client_end_recv(EPCClient client) {
+    Client *ptr = client.internal;
+    if (ptr->initialized != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
+
+    switch (shared->server.turn) {
+    case TURN_RECEIVER:
+        MEMORY_BARRIER;
+        shared->server.turn = TURN_SENDER;
+        return EPC_OK;
+    case TURN_SENDER:
+        return error(IPC, OUT_OF_ORDER);
+
+    case TURN_CLOSE:
+        return error(IPC, CLOSED);
+    case TURN_ERROR:
+        return error(IPC, SERVER);
+    default:
+        return error(IPC, ENUM);
+    }
+}
+EPCError epc_client_try_send(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms) {
+    EPCError err = EPC_OK;
+    Client *ptr = client.internal;
+    if (ptr->initialized != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
+    uint64_t last_time = 0;
+    BackoffTimeout backoff = (BackoffTimeout){0};
+
+    while (true) {
+        switch (shared->client.turn) {
+        case TURN_RECEIVER:
+            backoff_timeout(timeout_ms, &backoff);
+
+            if (!last_time) {
+                last_time = monotonic_time_ms();
+            } else if (update_timeout(&last_time, &timeout_ms)) {
+                return error(IPC, TIMEOUT);
+            }
+            break;
+
+        case TURN_SENDER:
+            goto ready;
+
+        case TURN_CLOSE:
+            return error(IPC, CLOSED);
+        case TURN_ERROR:
+            return error(IPC, SERVER);
+        default:
+            return error(IPC, ENUM);
+        }
+    }
+
+ready:
+    // By now, client.turn must be TURN_SENDER.
+    buf->buf = shared->buf + get_client_offset(&ptr->connection);
+    buf->size = ptr->connection.client_buf_size;
+
+    return EPC_OK;
+}
+
+EPCError epc_client_end_send(EPCClient client, uint32_t message_size) {
+    Client *ptr = client.internal;
+    if (ptr->initialized != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
+    if (message_size > ptr->connection.client_buf_size)
+        return error(ARGS, MESSAGE_TOO_LARGE);
+    volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
+
+    switch (shared->client.turn) {
+    case TURN_SENDER:
+        shared->client.message_size = message_size;
+        MEMORY_BARRIER;
+        shared->client.turn = TURN_RECEIVER;
+        // NOTE: Unchecked error.
+        post_semaphore(ptr->server_event_sem);
+        return EPC_OK;
+    case TURN_RECEIVER:
+        return error(IPC, OUT_OF_ORDER);
+
+    case TURN_CLOSE:
+        return error(IPC, CLOSED);
+    case TURN_ERROR:
+        return error(IPC, SERVER);
+    default:
+        return error(IPC, ENUM);
+    }
 }

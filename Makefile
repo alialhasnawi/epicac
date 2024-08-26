@@ -3,10 +3,10 @@ TARGET_EXEC ?= main
 
 BUILD_DIR ?= ./build
 
-SRCS := epicac.c meow.c
+SRCS := lib/epicac.c meow.c
 OBJS := $(SRCS:%=$(BUILD_DIR)/%.o)
 
-INC_DIRS := .
+INC_DIRS := ./lib
 INC_FLAGS := $(addprefix -I,$(INC_DIRS))
 
 CFLAGS ?= $(INC_FLAGS) -O2 -Wall -Wextra -Werror -std=c11 -pedantic -Wno-unused-variable -Wno-unused-function

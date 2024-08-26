@@ -1,4 +1,3 @@
-// TODO: API design.
 // Need to allow 0-copy messaging
 // Should be sync
 /*
@@ -50,62 +49,73 @@ recv()
 
 #define EPC_MAX_NAME 100
 
+#define ERROR_HIGH                                                                       \
+    X(OK, "Ok", "Success")                                                               \
+    X(ARGS, "Args", "Argument(s) invalid")                                               \
+    X(SYS, "Sys", "System call error")                                                   \
+    X(IPC, "IPC", "Internal epicac IPC error")                                           \
+    X(POLL, "Poll", "Polling status")                                                    \
+    X(COUNT, "N/A", "This is a count and seeing this message is a severe error")
+
 /// Error codes.
 typedef enum EPCErrorHigh {
-    EPC_ERR_H_OK = 0x0,
-    EPC_ERR_H_ARGS,
-    EPC_ERR_H_SYS,
-    EPC_ERR_H_IPC,
-    EPC_ERR_H_POLL,
-
-    EPC_ERR_H_COUNT,
+#define X(name, string, description) EPC_ERR_H_##name,
+    ERROR_HIGH
+#undef X
 } EPCErrorHigh;
+
+#define ERROR_LOW                                                                        \
+    X(NONE, "none", "there is no problem :)")                                            \
+    X(NOTHING_TO_DO, "nothing to do", "previous call did not need anything to happen")   \
+    X(ACCEPTED, "accepted", "new connection was accepted")                               \
+    X(GOT_MESSAGE, "got message", "received a message")                                  \
+    X(OUT_OF_ORDER, "invalid operation order",                                           \
+      "requested operation is out of regular send/receive message order")                \
+    X(TIMEOUT, "timeout", "the operation timed out")                                     \
+    X(NOT_INITIALIZED, "not initialized", "argument is not initialized")                 \
+    X(IS_NULL, "is null", "argument is NULL")                                            \
+    X(INDEX, "index", "index out of bounds")                                             \
+    X(ENUM, "enum", "invalid enum value")                                                \
+    X(ID, "ID", "invalid ID or no longer in use")                                        \
+    X(STRING_TOO_LONG, "string too long", "string too long")                             \
+    X(STRING_TOO_SHORT, "string too short", "string too short")                          \
+    X(STRING_INVALID, "string invalid", "string has invalid format or characters")       \
+    X(STRING_UTF8_INVALID, "string utf8 invalid", "string is not valid UTF-8")           \
+    X(MALLOC, "malloc()", "memory or resource allocation failed")                        \
+    X(FREE, "free()", "memory or resource freeing failed")                               \
+    X(DISK, "disk", "disk operation unsucessful")                                        \
+    X(PERMISSIONS, "permissions", "invalid permissions for completing the operation")    \
+    X(FD_LIMIT, "fd limit", "file descriptor limit has been reached")                    \
+    X(SIZE_TOO_SMALL, "size too small", "given size is too small")                       \
+    X(NAME_COLLISION, "name collision", "given name already in use")                     \
+    X(SEM_OPEN, "semaphore open", "failure to open/create semaphore")                    \
+    X(SEM_CLOSE, "semaphore close", "failure to close semaphore")                        \
+    X(SHM_OPEN, "shm open", "failure to open/create shared memory")                      \
+    X(SHM_CLOSE, "shm close", "failure to close shared memory")                          \
+    X(MUTEX_OPEN, "mutex open", "failure to open/create mutex")                          \
+    X(MUTEX_CLOSE, "mutex close", "failure to close mutex")                              \
+    X(MMAP, "memory mapping file", "failure to map file view into memory")               \
+    X(SEM, "semaphore", "failure to wait or post semaphore")                             \
+    X(MUTEX, "mutex", "failure to lock or unlock mutex")                                 \
+    X(TIME, "time", "failure to get a time counter")                                     \
+    X(ALREADY_OPEN, "already open", "already open")                                      \
+    X(COULD_NOT_CONNECT, "could not connect", "could not connect")                       \
+    X(VERSION_INCOMPATIBLE, "version incompatible", "version incompatible with current") \
+    X(HEADER_MALFORMED, "header malformed", "header malformed or partially initialized") \
+    X(INVALID_MESSAGE_SIZE, "invalid message size", "message size given is invalid")     \
+    X(MESSAGE_TOO_LARGE, "message too large",                                            \
+      "message size given is too large for buffer")                                      \
+    X(CLOSED, "connection closed", "connection closed")                                  \
+    X(CLIENT, "client", "client error")                                                  \
+    X(SERVER, "server", "server error")                                                  \
+    X(UNKNOWN, "unknown", "unknown error")                                               \
+    X(COUNT, "count", "this is a count and seeing this message is a severe error")
 
 /// Error details.
 typedef enum EPCErrorLow {
-    EPC_ERR_L_NONE = 0x0,
-
-    EPC_ERR_L_NOTHING_TO_DO,
-
-    EPC_ERR_L_TIMEOUT,
-
-    EPC_ERR_L_NOT_INITIALIZED,
-    EPC_ERR_L_IS_NULL,
-    EPC_ERR_L_INDEX,
-    EPC_ERR_L_STRING_TOO_LONG,
-    EPC_ERR_L_STRING_TOO_SHORT,
-    EPC_ERR_L_STRING_INVALID,
-    EPC_ERR_L_STRING_UTF8_INVALID,
-
-    EPC_ERR_L_MALLOC,
-    EPC_ERR_L_FREE,
-    EPC_ERR_L_DISK,
-    EPC_ERR_L_PERMISSIONS,
-    EPC_ERR_L_FD_LIMIT,
-    EPC_ERR_L_SIZE_TOO_SMALL,
-    EPC_ERR_L_NAME_COLLISION,
-    EPC_ERR_L_SEM_OPEN,
-    EPC_ERR_L_SEM_CLOSE,
-    EPC_ERR_L_SHM_OPEN,
-    EPC_ERR_L_SHM_CLOSE,
-    EPC_ERR_L_MUTEX_OPEN,
-    EPC_ERR_L_MUTEX_CLOSE,
-    EPC_ERR_L_MMAP,
-    EPC_ERR_L_SEM,
-    EPC_ERR_L_MUTEX,
-    EPC_ERR_L_TIME,
-
-    EPC_ERR_L_ALREADY_OPEN,
-    EPC_ERR_L_COULD_NOT_CONNECT,
-    EPC_ERR_L_VERSION_INCOMPATIBLE,
-    EPC_ERR_L_HEADER_MALFORMED,
-    EPC_ERR_L_INVALID_MESSAGE_SIZE,
-    EPC_ERR_L_CLIENT,
-    EPC_ERR_L_SERVER,
-
-    EPC_ERR_L_UNKNOWN,
-
-    EPC_ERR_L_COUNT,
+#define X(name, string, description) EPC_ERR_L_##name,
+    ERROR_LOW
+#undef X
 } EPCErrorLow;
 
 typedef struct EPCError {
@@ -116,6 +126,11 @@ typedef struct EPCError {
 /// Normal return.
 #define EPC_OK                                                                           \
     (EPCError) { 0, 0 }
+
+const char *epc_error_low_str(EPCError error);
+const char *epc_error_low_description(EPCError error);
+const char *epc_error_high_str(EPCError error);
+const char *epc_error_high_description(EPCError error);
 
 typedef uint8_t EPCPollStatus;
 #define EPC_POLL_ERROR 0x1
@@ -136,47 +151,43 @@ typedef struct {
 } EPCClientID;
 
 typedef struct EPCBuffer {
-    char *buf;
+    volatile uint8_t *buf;
     size_t size;
 } EPCBuffer;
 
 typedef struct EPCMessage {
-    char *buf;
+    volatile uint8_t *buf;
     size_t len;
-    EPCClientID id;
 } EPCMessage;
+
+#define EPC_OPTIONAL
 
 /**
  * Create a new server socket to listen to new connections.
  */
-typedef struct EPC_server_bind_args {
-    char *name;
-    uint32_t timeout_ms;
-} EPC_server_bind_args;
 EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms);
-EPCError epc_server_close(EPCServer server);
+EPCError epc_server_close(EPCServer *server);
 
-typedef struct EPC_server_try_recv_args {
-    uint32_t timeout_ms;
-} EPC_server_try_recv_args;
-EPCError epc_server_try_recv(EPCServer server, EPCMessage *message, uint32_t timeout_ms);
+EPCError epc_server_try_recv_or_accept(EPCServer server,
+                                       EPC_OPTIONAL EPCClientID *client_id,
+                                       EPCMessage *message, uint32_t requested_size,
+                                       uint32_t timeout_ms);
 EPCError epc_server_end_recv(EPCServer server, EPCClientID client_id);
 EPCError epc_server_try_send(EPCServer server, EPCClientID client_id, EPCBuffer *buf,
                              uint32_t timeout_ms);
-EPCError epc_server_end_send(EPCServer server, EPCClientID client_id);
-EPCError epc_server_resize(EPCServer server, EPCClientID client_id,
-                           uint32_t new_send_size);
+EPCError epc_server_end_send(EPCServer server, EPCClientID client_id,
+                             uint32_t message_size);
 
 /**
  * Create a new client socket and connect to a server.
  */
-EPCError epc_client_connect(EPCClient *client, char *name, uint32_t timeout_ms);
-EPCError epc_client_disconnect(EPCClient client);
+EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_size,
+                            uint32_t timeout_ms);
+EPCError epc_client_disconnect(EPCClient *client);
 
 EPCError epc_client_try_recv(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms);
 EPCError epc_client_end_recv(EPCClient client);
 EPCError epc_client_try_send(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms);
-EPCError epc_client_end_send(EPCClient client);
-EPCError epc_client_resize(EPCClient client, uint32_t new_send_size);
+EPCError epc_client_end_send(EPCClient client, uint32_t message_size);
 
 #endif
