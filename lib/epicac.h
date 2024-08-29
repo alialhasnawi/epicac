@@ -1,16 +1,4 @@
-// Need to allow 0-copy messaging
-// Should be sync
 /*
-- client and server are created (order doesn't matter)
-- client or server can send as long as the other allows it
-- send API is made of multiple steps
-    - can send: only return when allowed to send
-    - send: signals to the other that a message was sent
-    * in between the 2, the actual writes happen
-- recieve API is simillar:
-    - can receive: only return when there's data to be used
-    - receive: signal to the other that the message has been used
-
 so basically:
 
 // server.c
@@ -46,6 +34,10 @@ recv()
 #define EPC_H
 
 #include <stdint.h>
+
+#define EPC_VERSION_MAJOR 0
+#define EPC_VERSION_MINOR 0
+#define EPC_VERSION_PATCH 1
 
 #define EPC_MAX_NAME 100
 

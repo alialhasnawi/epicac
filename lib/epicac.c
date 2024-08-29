@@ -123,11 +123,14 @@ const char *epc_error_high_description(EPCError error) {
 #define STRING_(x) #x
 #define STRING(x) STRING_(x)
 
+#define ULL_VAL_(x) x##ull
+#define ULL_VAL(x) ULL_VAL_(x)
+
 // Version string is 12 hexadecimal characters or 6 bytes (major-minor-patch).
+#define EPC_VERSION_VALUE                                                                \
+    ((ULL_VAL(EPC_VERSION_MAJOR) << 32ull) | (ULL_VAL(EPC_VERSION_MINOR) << 16ull) |     \
+     (ULL_VAL(EPC_VERSION_PATCH)))
 #define EPC_MIN_COMPAT_VERSION 000000000001
-#define EPC_VERSION 000000000001
-#define EPC_VERSION_STRING STRING(EPC_VERSION)
-#define EPC_VERSION_VALUE HEX(EPC_VERSION)
 #define EPC_MIN_COMPAT_VERSION_VALUE HEX(EPC_MIN_COMPAT_VERSION)
 
 typedef struct EPCHeader {
@@ -1107,6 +1110,7 @@ void backoff_timeout(uint32_t timeout_ms, BackoffTimeout *backoff) {
 EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
     EPCError err = EPC_OK;
     EPCError err_cleanup = EPC_OK;
+    (void)err_cleanup;
 
 #undef CLEANUP
 #define CLEANUP cleanup_nothing
@@ -1304,6 +1308,7 @@ static EPCError epc_server_accept(Server *ptr, EPCClientID *client_id,
 
     EPCError err = EPC_OK;
     EPCError err_cleanup = EPC_OK;
+    (void)err_cleanup;
 
     String name_str = {.len = ptr->name_len, .bytes = ptr->name};
     String str = {0};
@@ -1466,6 +1471,9 @@ static EPCError epc_server_disconnect_client(Server *ptr, uint32_t index,
     EPCError err_cleanup = EPC_OK;
     String name_str = {.len = ptr->name_len, .bytes = ptr->name};
     String str = {0};
+    (void)err_cleanup;
+    (void)name_str;
+    (void)str;
 
     ClientConnection connection = {0};
     if ((err = Array_ClientConnection_at_checked(&ptr->clients, &connection, index)).high)
@@ -1507,6 +1515,8 @@ static EPCError epc_server_disconnect_client(Server *ptr, uint32_t index,
 EPCError epc_server_close(EPCServer *server) {
     String str = {0};
     EPCError err = EPC_OK;
+    (void)str;
+    (void)err;
 
     Server *ptr = server->internal;
 
@@ -1641,7 +1651,6 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
 }
 
 EPCError epc_server_end_recv(EPCServer server, EPCClientID client_id) {
-    EPCError err = EPC_OK;
     Server *ptr = server.internal;
     if (ptr->initialized != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
@@ -1673,7 +1682,6 @@ EPCError epc_server_end_recv(EPCServer server, EPCClientID client_id) {
 
 EPCError epc_server_try_send(EPCServer server, EPCClientID client_id, EPCBuffer *buf,
                              uint32_t timeout_ms) {
-    EPCError err = EPC_OK;
     Server *ptr = server.internal;
 
     if (ptr->initialized != INITIALIZED_CANARY)
@@ -1723,7 +1731,6 @@ ready:
 
 EPCError epc_server_end_send(EPCServer server, EPCClientID client_id,
                              uint32_t message_size) {
-    EPCError err = EPC_OK;
     Server *ptr = server.internal;
 
     if (ptr->initialized != INITIALIZED_CANARY)
@@ -1770,7 +1777,6 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_si
     uint64_t last_time = monotonic_time_ms();
 
     EPCError err = EPC_OK;
-    EPCError err_cleanup = EPC_OK;
 
     String str = {0};
 
@@ -1960,9 +1966,6 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_si
     if ((err = open_shmem(&ptr->connection.shmem, str, shmem_size, NULL)).high)
         goto CLEANUP;
 
-    // Initialize internal state.
-    volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
-
     // Indicate to server that the client area has been initialized.
     join_area->client_ready = true;
 
@@ -2011,7 +2014,6 @@ static void epc_client_disconnect_(Client *client, SharedTurn turn) {
 }
 
 EPCError epc_client_disconnect(EPCClient *client) {
-    EPCError err = EPC_OK;
     Client *ptr = client->internal;
 
     if (ptr == NULL)
@@ -2099,7 +2101,6 @@ EPCError epc_client_end_recv(EPCClient client) {
     }
 }
 EPCError epc_client_try_send(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms) {
-    EPCError err = EPC_OK;
     Client *ptr = client.internal;
     if (ptr->initialized != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);

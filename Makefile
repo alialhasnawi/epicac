@@ -1,23 +1,35 @@
 CC ?= gcc
-TARGET_EXEC ?= main
+ifeq ($(OS), Windows_NT)
+EXE_SUFFIX := .exe
+endif
 
 BUILD_DIR ?= ./build
 
-SRCS := lib/epicac.c meow.c
+SRCS := lib/epicac.c
 OBJS := $(SRCS:%=$(BUILD_DIR)/%.o)
 
 INC_DIRS := ./lib
 INC_FLAGS := $(addprefix -I,$(INC_DIRS))
 
-CFLAGS ?= $(INC_FLAGS) -O2 -Wall -Wextra -Werror -std=c11 -pedantic -Wno-unused-variable -Wno-unused-function
+CC := gcc
+CFLAGS ?= $(INC_FLAGS) -O2 -Wall -Wextra -Werror -std=c11 -pedantic
 
-$(BUILD_DIR)/$(TARGET_EXEC): $(OBJS)
-	gcc $(OBJS) -o $@ $(LDFLAGS)
+.PHONY: meow epicat
 
-# c source
+EPICAT_EXE := $(BUILD_DIR)/epicat$(EXE_SUFFIX)
+epicat: $(EPICAT_EXE)
+$(EPICAT_EXE): $(OBJS) $(BUILD_DIR)/cli/main.c.o
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+MEOW_EXE := $(BUILD_DIR)/meow$(EXE_SUFFIX)
+meow: $(MEOW_EXE)
+$(MEOW_EXE): $(OBJS) $(BUILD_DIR)/meow.c.o
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+# C source
 $(BUILD_DIR)/%.c.o: %.c
-	$(MKDIR_P) $(dir $@)
-	gcc $(CFLAGS) -c $< -o $@
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 .PHONY: clean
 
