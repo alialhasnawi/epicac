@@ -42,12 +42,12 @@ recv()
 #define EPC_MAX_NAME 100
 
 #define ERROR_HIGH                                                                       \
-    X(OK, "Ok", "Success")                                                               \
-    X(ARGS, "Args", "Argument(s) invalid")                                               \
-    X(SYS, "Sys", "System call error")                                                   \
-    X(IPC, "IPC", "Internal epicac IPC error")                                           \
-    X(POLL, "Poll", "Polling status")                                                    \
-    X(COUNT, "N/A", "This is a count and seeing this message is a severe error")
+    X(OK, "Ok", "success")                                                               \
+    X(ARGS, "Args", "argument(s) invalid")                                               \
+    X(SYS, "Sys", "system call error")                                                   \
+    X(IPC, "IPC", "internal epicac IPC error")                                           \
+    X(POLL, "Poll", "polling status")                                                    \
+    X(COUNT, "N/A", "this is a count and seeing this message is a severe error")
 
 /// Error codes.
 typedef enum EPCErrorHigh {
@@ -123,13 +123,8 @@ const char *epc_error_low_str(EPCError error);
 const char *epc_error_low_description(EPCError error);
 const char *epc_error_high_str(EPCError error);
 const char *epc_error_high_description(EPCError error);
-
-typedef uint8_t EPCPollStatus;
-#define EPC_POLL_ERROR 0x1
-/// The socket is ready to send data.
-#define EPC_POLL_SEND 0x2
-/// The socket is ready to receive data.
-#define EPC_POLL_RECV 0x4
+int epc_error_ok(EPCError error);
+int epc_error_not_ok(EPCError error);
 
 typedef struct {
     void *internal;

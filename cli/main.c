@@ -10,32 +10,43 @@
 #include "epicac.h"
 #include <ctype.h>
 
-static const uint32_t DEFAULT_BUFFER_SIZE = 4096;
+#ifdef _WIN32
+#define EPC_WINDOWS
+#include <Windows.h>
+#else
+#define EPC_POSIX
+#include <fcntl.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#endif
 
-const char *program_name = "epicat";
+static const uint32_t DEFAULT_BUFFER_SIZE = 4096;
+static const uint32_t DEFAULT_MESSAGE_SIZE = 4096;
+
+#define PROGRAM_NAME "epicat"
+const char *program_name = PROGRAM_NAME;
 
 #define STR_(x) #x
 #define STR(x) STR_(x)
 
-#define ERROR(...)                                                                       \
+#define EPICAT_ERROR(...)                                                                \
     do {                                                                                 \
-        fprintf(stderr, "%s: ", program_name);                                           \
-        fprintf(stderr, __VA_ARGS__);                                                    \
+        fprintf(stderr, PROGRAM_NAME ": "__VA_ARGS__);                                   \
         exit(2);                                                                         \
     } while (0)
 
 #define USAGE_ERROR(...)                                                                 \
     do {                                                                                 \
-        fprintf(stderr, "%s: ", program_name);                                           \
-        fprintf(stderr, __VA_ARGS__);                                                    \
+        fprintf(stderr, PROGRAM_NAME ": "__VA_ARGS__);                                   \
         fprintf(stderr, usage_string);                                                   \
         exit(2);                                                                         \
     } while (0);
 
 #define HELP_ERROR(...)                                                                  \
     do {                                                                                 \
-        fprintf(stderr, "%s: ", program_name);                                           \
-        fprintf(stderr, __VA_ARGS__);                                                    \
+        fprintf(stderr, PROGRAM_NAME ": "__VA_ARGS__);                                   \
         fprintf(stderr, help_string);                                                    \
         exit(2);                                                                         \
     } while (0);
@@ -49,7 +60,9 @@ static const char *help_string = USAGE_STRING
     "Example to open a server on address 'foo_bar': epicat -l foo_bar\n"
     "ADDRESS is a string not containing forwards slashes.\n"
     "  -l, --listen            start a server instead of a client\n"
-    "  -b, --buffer-size=NUM   use an internal max message size of NUM bytes\n"
+    "  -b, --buffer-size=NUM   use an internal IO buffer of size NUM bytes\n"
+    "  -m, --message-size=NUM  use an internal max message size of NUM bytes\n"
+    "  -v, --verbose           output extra information\n"
     "  -V, --version           output version info and exit\n"
     "  -h, --help              display this help and exit\n";
 
@@ -79,7 +92,9 @@ typedef struct ArgDefinition {
 typedef struct EpicatArgs {
     const char *address;
     uint32_t buffer_size;
+    uint32_t message_size;
     bool listen;
+    bool verbose;
     bool print_version;
     bool print_help;
 } EpicatArgs;
@@ -87,7 +102,9 @@ typedef struct EpicatArgs {
 static const ArgDefinition ARGS[] = {
     {"address", .type = ARG_TYPE_STRING, INTO_ARG(address)},
     {"--buffer-size", 'b', ARG_TYPE_UINT32, INTO_ARG(buffer_size)},
+    {"--message-size", 'm', ARG_TYPE_UINT32, INTO_ARG(message_size)},
     {"--listen", 'l', ARG_TYPE_FLAG, INTO_ARG(listen)},
+    {"--verbose", 'v', ARG_TYPE_FLAG, INTO_ARG(verbose)},
     {"--version", 'V', ARG_TYPE_FLAG, INTO_ARG(print_version)},
     {"--help", 'h', ARG_TYPE_FLAG, INTO_ARG(print_help)},
 };
@@ -162,7 +179,9 @@ static inline void parse_args(int argc, char *argv[], EpicatArgs *args) {
 
     *args = (EpicatArgs){.listen = false,
                          .buffer_size = DEFAULT_BUFFER_SIZE,
+                         .message_size = DEFAULT_MESSAGE_SIZE,
                          .address = NULL,
+                         .verbose = false,
                          .print_version = false,
                          .print_help = false};
     char *args_base = (char *)args;
@@ -278,17 +297,39 @@ static inline void parse_args(int argc, char *argv[], EpicatArgs *args) {
     }
 }
 
+// ███████ ███████ ██████  ██    ██ ███████ ██████
+// ██      ██      ██   ██ ██    ██ ██      ██   ██
+// ███████ █████   ██████  ██    ██ █████   ██████
+//      ██ ██      ██   ██  ██  ██  ██      ██   ██
+// ███████ ███████ ██   ██   ████   ███████ ██   ██
+
+//  ██████ ██      ██ ███████ ███    ██ ████████
+// ██      ██      ██ ██      ████   ██    ██
+// ██      ██      ██ █████   ██ ██  ██    ██
+// ██      ██      ██ ██      ██  ██ ██    ██
+//  ██████ ███████ ██ ███████ ██   ████    ██
+
+int epicat_client(EpicatArgs *args) {
+    HANDLE windows_stdin = GetStdHandle(STD_INPUT_HANDLE);
+    if (windows_stdin == INVALID_HANDLE_VALUE) {
+        EPICAT_ERROR("GetStdHandle() for stdin was invalid");
+        return 1;
+    }
+
+    char *buffer = malloc(sizeof(char) * args->buffer_size);
+
+    while (fgets(buffer, args->buffer_size, stdin) != NULL) {
+        if (fputs(buffer, stdout) == EOF) {
+            perror(PROGRAM_NAME ": fwrite");
+        }
+    };
+
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     EpicatArgs args;
     parse_args(argc, argv, &args);
-
-    printf("   address: %s\n"
-           "   buffer_size: %d\n"
-           "   listen: %s\n"
-           "   print_help: %s\n"
-           "   print_version: %s\n",
-           args.address, args.buffer_size, repr_bool(args.listen),
-           repr_bool(args.print_help), repr_bool(args.print_version));
 
     if (args.print_help) {
         printf("%s", help_string);
@@ -298,8 +339,19 @@ int main(int argc, char *argv[]) {
         exit(0);
     }
 
+    if (args.verbose) {
+        printf("using config:   address: %s\n"
+               "                buffer size: %d\n"
+               "                listen: %s\n",
+               repr_str(args.address), args.buffer_size, repr_bool(args.listen));
+    }
+
     if (args.address == NULL) {
         USAGE_ERROR("address not provided\n");
+    }
+
+    if (args.buffer_size < 1) {
+        USAGE_ERROR("internal buffer cannot have size 0\n");
     }
 
     return 0;

@@ -14,11 +14,18 @@ INC_FLAGS := $(addprefix -I,$(INC_DIRS))
 CC := gcc
 CFLAGS ?= $(INC_FLAGS) -O2 -Wall -Wextra -Werror -std=c11 -pedantic
 
-.PHONY: meow epicat
+.PHONY: meow epicat test
 
 EPICAT_EXE := $(BUILD_DIR)/epicat$(EXE_SUFFIX)
 epicat: $(EPICAT_EXE)
 $(EPICAT_EXE): $(OBJS) $(BUILD_DIR)/cli/main.c.o
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+TEST_EXE := $(BUILD_DIR)/test$(EXE_SUFFIX)
+test: $(TEST_EXE)
+	$(TEST_EXE)
+
+$(TEST_EXE): $(OBJS) $(BUILD_DIR)/test/test.c.o
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 MEOW_EXE := $(BUILD_DIR)/meow$(EXE_SUFFIX)

@@ -18,6 +18,8 @@
 //   address.
 
 // TODO: test on Linux
+// TODO: fix re-entrant/recursive mutext bug on Windows (need exclusion even on same
+//       thread like in POSIX)
 // TODO: ensure setting a timeout of 0 works as expected
 
 #include "epicac.h"
@@ -107,6 +109,11 @@ const char *epc_error_high_description(EPCError error) {
     }
 }
 
+int epc_error_ok(EPCError error) { return error.high == 0; }
+int epc_error_not_ok(EPCError error) { return !epc_error_ok(error); }
+#define epc_ok epc_error_ok
+#define epc_not_ok epc_error_not_ok
+
 // Compiler specific config.
 #if defined(_MSC_VER)
 #define thread_local __declspec(thread)
@@ -152,7 +159,7 @@ const EPCHeader EPC_HEADER = {.first_byte = "\x8F",          // High bit byte.
                               .win_eof = "\x1A", // Ctrl+Z (oldschool Windows end-of-file)
                               .unix_line_terminator = "\n"};
 
-EPCError check_valid_header(EPCHeader *header) {
+static EPCError check_valid_header(EPCHeader *header) {
     bool ok = true;
     ok = ok && !memcmp(header->first_byte, EPC_HEADER.first_byte,
                        sizeof(EPC_HEADER.first_byte));
@@ -170,7 +177,7 @@ EPCError check_valid_header(EPCHeader *header) {
     return EPC_OK;
 }
 
-EPCError check_compatibility(EPCHeader *header) {
+static EPCError check_compatibility(EPCHeader *header) {
     EPCError err = EPC_OK;
 
     if ((err = check_valid_header(header)).high)
@@ -341,7 +348,7 @@ static EPCError utf8_to_wide_char_scratch(const char *name, size_t len, WCHAR bu
 //      ██ ██   ██ ██  ██  ██ ██      ██  ██  ██
 // ███████ ██   ██ ██      ██ ███████ ██      ██
 
-uint64_t get_page_size() {
+static uint64_t get_page_size() {
     static uint64_t page_size = 0;
     if (page_size == 0) {
 #ifdef EPC_WINDOWS
@@ -739,7 +746,7 @@ static EPCError release_mutex(Mutex mutex) {
         Type *slice;                                                                     \
     } TypeName;                                                                          \
                                                                                          \
-    EPCError TypeName##_new(TypeName *list, size_t initial_size) {                       \
+    static inline EPCError TypeName##_new(TypeName *list, size_t initial_size) {         \
         size_t capacity = initial_size;                                                  \
         Type *slice = malloc(capacity * sizeof(Type));                                   \
         if (!slice) {                                                                    \
@@ -749,13 +756,13 @@ static EPCError release_mutex(Mutex mutex) {
         return EPC_OK;                                                                   \
     }                                                                                    \
                                                                                          \
-    void TypeName##_free(TypeName *list) {                                               \
+    static inline void TypeName##_free(TypeName *list) {                                 \
         if (list) {                                                                      \
             free(list->slice);                                                           \
         }                                                                                \
     }                                                                                    \
                                                                                          \
-    EPCError TypeName##_append(TypeName *list, Type value) {                             \
+    static inline EPCError TypeName##_append(TypeName *list, Type value) {               \
         if (list == NULL) {                                                              \
             return error(ARGS, IS_NULL);                                                 \
         }                                                                                \
@@ -778,7 +785,7 @@ static EPCError release_mutex(Mutex mutex) {
         return EPC_OK;                                                                   \
     }                                                                                    \
                                                                                          \
-    EPCError TypeName##_delete_unordered(TypeName *list, size_t i) {                     \
+    static inline EPCError TypeName##_delete_unordered(TypeName *list, size_t i) {       \
         if (list == NULL) {                                                              \
             return error(ARGS, IS_NULL);                                                 \
         }                                                                                \
@@ -790,7 +797,7 @@ static EPCError release_mutex(Mutex mutex) {
         list->slice[i] = list->slice[list->len];                                         \
         return EPC_OK;                                                                   \
     }                                                                                    \
-    EPCError TypeName##_at_checked(TypeName *list, Type *item, size_t i) {               \
+    static inline EPCError TypeName##_at_checked(TypeName *list, Type *item, size_t i) { \
         if (list == NULL) {                                                              \
             return error(ARGS, IS_NULL);                                                 \
         }                                                                                \
@@ -802,7 +809,7 @@ static EPCError release_mutex(Mutex mutex) {
         return EPC_OK;                                                                   \
     }                                                                                    \
                                                                                          \
-    EPCError TypeName##_delete_ordered(TypeName *list, size_t i) {                       \
+    static inline EPCError TypeName##_delete_ordered(TypeName *list, size_t i) {         \
         if (list == NULL) {                                                              \
             return error(ARGS, IS_NULL);                                                 \
         }                                                                                \
@@ -836,7 +843,7 @@ typedef struct BitArray {
     Array_U8 array;
 } BitArray;
 
-EPCError BitArray_new(BitArray *array, uint32_t initial_size) {
+static EPCError BitArray_new(BitArray *array, uint32_t initial_size) {
     EPCError err = EPC_OK;
 
     size_t byte_size = (initial_size + 8 - 1) / 8; // Floor division.
@@ -874,7 +881,7 @@ static inline uint8_t find_first_set_index(uint8_t value) {
 #endif
 }
 
-EPCError BitArray_get_new_bit(BitArray *array, uint32_t *index) {
+static EPCError BitArray_get_new_bit(BitArray *array, uint32_t *index) {
     EPCError err = EPC_OK;
     uint32_t byte_index = 0;
     uint32_t bit_index = 0;
@@ -911,7 +918,7 @@ EPCError BitArray_get_new_bit(BitArray *array, uint32_t *index) {
     return err;
 }
 
-void BitArray_unset_bit_unchecked(BitArray *array, uint32_t index) {
+static void BitArray_unset_bit_unchecked(BitArray *array, uint32_t index) {
     uint32_t byte_index = index / 8;
     uint32_t bit_index = index % 8;
 
@@ -920,7 +927,7 @@ void BitArray_unset_bit_unchecked(BitArray *array, uint32_t index) {
     array->array.slice[byte_index] &= ~(1 << bit_index);
 }
 
-void BitArray_free(BitArray *array) { Array_U8_free(&array->array); }
+static void BitArray_free(BitArray *array) { Array_U8_free(&array->array); }
 
 typedef struct JoinArea {
     EPCHeader server_header; // Should be set to EPC_HEADER by server.
@@ -1006,7 +1013,7 @@ typedef struct Client {
     static type min_##name(type a, type b) { return (a < b) ? a : b; }
 MIN(u32, uint32_t)
 
-uint64_t monotonic_time_ms() {
+static uint64_t monotonic_time_ms() {
 #ifdef EPC_WINDOWS
     return GetTickCount64();
 #elif defined(EPC_POSIX)
@@ -1019,7 +1026,7 @@ uint64_t monotonic_time_ms() {
 #endif
 }
 
-bool update_timeout(uint64_t *last_time, uint32_t *timeout_ms) {
+static bool update_timeout(uint64_t *last_time, uint32_t *timeout_ms) {
     uint64_t now = monotonic_time_ms();
     assert("Clock is incosistent" && *last_time <= now);
     uint64_t elapsed = now - *last_time;
@@ -1035,7 +1042,7 @@ bool update_timeout(uint64_t *last_time, uint32_t *timeout_ms) {
     return false;
 }
 
-void sleep_ms(uint32_t time_ms) {
+static void sleep_ms(uint32_t time_ms) {
 #ifdef EPC_WINDOWS
     Sleep(time_ms);
 #elif defined(EPC_POSIX)
@@ -1058,7 +1065,7 @@ typedef struct BackoffTimeout {
     uint8_t iterations;
 } BackoffTimeout;
 
-uint8_t get_next_backoff_stage(uint8_t current_backoff_stage) {
+static uint8_t get_next_backoff_stage(uint8_t current_backoff_stage) {
     switch (current_backoff_stage) {
     case POLL_STAGE_SPIN:
         return POLL_STAGE_15MS;
@@ -1071,7 +1078,7 @@ uint8_t get_next_backoff_stage(uint8_t current_backoff_stage) {
     return 0xff;
 }
 
-void backoff_timeout(uint32_t timeout_ms, BackoffTimeout *backoff) {
+static void backoff_timeout(uint32_t timeout_ms, BackoffTimeout *backoff) {
     if (timeout_ms == 0)
         return;
 
@@ -1106,6 +1113,68 @@ void backoff_timeout(uint32_t timeout_ms, BackoffTimeout *backoff) {
 // ███████ █████   ██████  ██    ██ █████   ██████
 //      ██ ██      ██   ██  ██  ██  ██      ██   ██
 // ███████ ███████ ██   ██   ████   ███████ ██   ██
+
+#ifdef EPC_WINDOWS
+
+// Needed because address_mutex is re-entrant (ie. recursive).
+// Keeping track of address per thread prevents starting the same
+// server on multiple threads.
+
+DEFINE_ARRAY(String, Array_String)
+
+static thread_local Array_String used_addresses = {.slice = NULL};
+
+static inline bool string_equals(String s1, String s2) {
+    return s1.len == s2.len && !strcmp(s1.bytes, s2.bytes);
+}
+
+static inline EPCError windows_use_address(String address) {
+    EPCError err = EPC_OK;
+
+    // Initialize the list if not already done.
+    if (used_addresses.slice == NULL) {
+        if (epc_error_not_ok(err = Array_String_new(&used_addresses, 16))) {
+            return err;
+        }
+    }
+
+    // Check if the string is in the currently used addresses.
+    for (uint32_t i = 0; i < used_addresses.len; ++i) {
+        String used_address = used_addresses.slice[i];
+        if (string_equals(used_address, address)) {
+            return error(IPC, ALREADY_OPEN);
+        }
+    }
+
+    // Put the string into the array list.
+    // NOTE: This memory should live as long as the original socket.
+    //       Avoid allocating a copy unnecessarily.
+    if (epc_error_not_ok(err = Array_String_append(&used_addresses, address))) {
+        return err;
+    }
+
+    return EPC_OK;
+}
+
+static inline EPCError windows_free_address(String address) {
+    EPCError err = EPC_OK;
+
+    // Find the string in the currently used addresses.
+    for (uint32_t i = 0; i < used_addresses.len; ++i) {
+        String used_address = used_addresses.slice[i];
+        if (string_equals(used_address, address)) {
+            if (epc_error_not_ok(err =
+                                     Array_String_delete_unordered(&used_addresses, i))) {
+                return err;
+            }
+            return EPC_OK;
+        }
+    }
+
+    assert("should only ever free used addresses" && false);
+    return EPC_OK;
+}
+#endif
 
 EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
     EPCError err = EPC_OK;
@@ -1148,22 +1217,35 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
         &(BuildNameParams){.name = name_str,
                            .object_type_str = epc_prefix_server_addr_lock},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (err.high)
+    if (err.high) {
         goto CLEANUP;
-    if ((err = open_mutex(&ptr->address_mutex, str)).high)
+    }
+    if ((err = open_mutex(&ptr->address_mutex, str)).high) {
         goto CLEANUP;
+    }
 
 #undef CLEANUP
 #define CLEANUP cleanup_addr_mutex_opened
 
     if ((err = wait_mutex(ptr->address_mutex, timeout_ms)).high) {
-        if (err.low == EPC_ERR_L_TIMEOUT)
+        if (err.low == EPC_ERR_L_TIMEOUT) {
             err = error(IPC, ALREADY_OPEN);
+        }
         goto CLEANUP;
     }
 
 #undef CLEANUP
 #define CLEANUP cleanup_addr_mutex_locked
+
+#ifdef EPC_WINDOWS
+    if (epc_not_ok(err = windows_use_address(name_str))) {
+        goto CLEANUP;
+    }
+
+#undef CLEANUP
+#define CLEANUP cleanup_win_address_used
+
+#endif
 
     // Initialize client array list.
     if ((err = Array_ClientConnection_new(&ptr->clients, 8)).high)
@@ -1274,6 +1356,8 @@ cleanup_client_bitarray_alloced:
     BitArray_free(&ptr->client_ids);
 cleanup_client_array_alloced:
     Array_ClientConnection_free(&ptr->clients);
+cleanup_win_address_used:
+    windows_free_address(name_str);
 cleanup_addr_mutex_locked:
     release_mutex(ptr->address_mutex);
 cleanup_addr_mutex_opened:
@@ -1284,10 +1368,8 @@ cleanup_nothing:
     return err;
 }
 
-uint32_t id32() {
-    static uint32_t last_num = 0;
-    return last_num++;
-}
+static thread_local uint32_t last_num = 0;
+uint32_t id32() { return last_num++; }
 
 static inline EPCClientID id_from_connection(ClientConnection *connection) {
     return (EPCClientID){(((uint64_t)connection->id) << 32) | connection->dynamic_id};
@@ -1519,6 +1601,7 @@ EPCError epc_server_close(EPCServer *server) {
     (void)err;
 
     Server *ptr = server->internal;
+    String name_str = {.len = ptr->name_len, .bytes = ptr->name};
 
     if (ptr == NULL)
         return error(ARGS, IS_NULL);
@@ -1566,6 +1649,9 @@ EPCError epc_server_close(EPCServer *server) {
 
     // Allow the address to be reused.
     release_mutex(ptr->address_mutex);
+#ifdef EPC_WINDOWS
+    windows_free_address(name_str);
+#endif
     close_mutex(ptr->address_mutex);
 
     // Free all memory related to clients.
