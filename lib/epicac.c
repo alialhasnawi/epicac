@@ -22,23 +22,35 @@
 //       thread like in POSIX)
 // TODO: ensure setting a timeout of 0 works as expected
 
-#include "epicac.h"
-
-#include <assert.h>
-#include <stdbool.h>
-#include <stdio.h>
-
 #ifdef _WIN32
 #define EPC_WINDOWS
 #include <Windows.h>
 #else
 #define EPC_POSIX
+
+#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
+
+#include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <semaphore.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 #endif
+
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "epicac.h"
 
 #ifndef static_assert
 #define static_assert(ignore, args)
@@ -125,6 +137,14 @@ int epc_error_not_ok(EPCError error) { return !epc_error_ok(error); }
 #define thread_local
 #endif
 
+#if defined(_MSC_VER)
+#define MEMORY_BARRIER MemoryBarrier()
+#elif defined(__GNUC__) || defined(__clang__)
+#define MEMORY_BARRIER __sync_synchronize()
+#else
+#error "Compiler does not support memory fence/barrier."
+#endif
+
 #define HEX_(x) 0x##x
 #define HEX(x) HEX_(x)
 #define STRING_(x) #x
@@ -189,6 +209,8 @@ static EPCError check_compatibility(EPCHeader *header) {
 
     return err;
 }
+
+static const uint32_t INITIALIZED_CANARY = 0xd75588ab;
 
 // ███████ ████████ ██████  ██ ███    ██  ██████
 // ██         ██    ██   ██ ██ ████   ██ ██
@@ -421,21 +443,21 @@ static EPCError open_shmem(ShmemBuffer *shmem, String name, size_t size,
     if (already_open != NULL) {
         // Assume it already exists. Try and open without O_CREAT first.
         *already_open = true;
-        fd_or_err = shm_open(name->bytes, O_RDWR, 0644);
+        fd_or_err = shm_open(name.bytes, O_RDWR, 0644);
         if ((fd_or_err == -1) && (errno == ENOENT)) {
             // If it doesn't exist, set `already_open` and create it.
-            fd_or_err = shm_open(name->bytes, O_CREAT | O_RDWR, 0644);
+            fd_or_err = shm_open(name.bytes, O_CREAT | O_RDWR, 0644);
             *already_open = false;
         }
     } else {
-        fd_or_err = shm_open(name->bytes, O_CREAT | O_RDWR, 0644);
+        fd_or_err = shm_open(name.bytes, O_CREAT | O_RDWR, 0644);
     }
     if (fd_or_err == -1) {
         return error(SYS, SHM_OPEN);
     }
 
     if (ftruncate(fd_or_err, shmem->size) == -1) {
-        shm_unlink(shmem->name);
+        shm_unlink(name.bytes);
         return error(SYS, SHM_OPEN);
     }
 
@@ -464,7 +486,7 @@ static EPCError close_shmem(ShmemBuffer shmem) {
     return success ? EPC_OK : error(SYS, FREE);
 #elif defined(EPC_POSIX)
     bool success = true;
-    success = success && (munmap(shmem.buf, shmem.size) == 0);
+    success = success && (munmap((void *)shmem.buf, shmem.size) == 0);
     success = success && (close(shmem.fd) == 0);
     return success ? EPC_OK : error(SYS, FREE);
 #endif
@@ -508,7 +530,7 @@ static EPCError open_semaphore(Semaphore *semaphore, String name) {
     *semaphore = sem;
     return EPC_OK;
 #elif defined(EPC_POSIX)
-    Semaphore sem = sem_open(name, O_CREAT, 0644, 0);
+    Semaphore sem = sem_open(name.bytes, O_CREAT, 0644, 0);
     if (sem == SEM_FAILED) {
         return error(SYS, SEM_OPEN);
     }
@@ -533,6 +555,10 @@ static EPCError destroy_semaphore(const char *name) {
 }
 #endif
 
+#ifdef EPC_POSIX
+static const long ONE_BILLION = 1000000000L;
+#endif
+
 static EPCError wait_semaphore(Semaphore sem, uint32_t timeout_ms) {
 #ifdef EPC_WINDOWS
     DWORD status = WaitForSingleObject(sem, timeout_ms);
@@ -552,6 +578,11 @@ static EPCError wait_semaphore(Semaphore sem, uint32_t timeout_ms) {
         return error(SYS, TIME);
     ts.tv_sec += timeout_ms / 1000;
     ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    // Important: normalize tv_nsec to be less than 1,000,000,000
+    if (ts.tv_nsec >= ONE_BILLION) {
+        ts.tv_sec += (ts.tv_nsec / ONE_BILLION);
+        ts.tv_nsec %= ONE_BILLION;
+    }
     int status = sem_timedwait(sem, &ts);
     if (status == 0) {
         return EPC_OK;
@@ -586,10 +617,10 @@ static EPCError post_semaphore(Semaphore sem) {
 #ifdef EPC_WINDOWS
 typedef HANDLE Mutex;
 #elif defined(EPC_POSIX)
-struct WrappedPosixMutex {
+typedef struct WrappedPosixMutex {
     pthread_mutex_t mutex;
     uint32_t initialized;
-};
+} WrappedPosixMutex;
 struct PosixMutexPolyfill {
     WrappedPosixMutex *shared;
     ShmemBuffer shmem;
@@ -598,12 +629,12 @@ typedef struct PosixMutexPolyfill Mutex;
 
 static void short_nap() {
     struct timespec req, rem;
-    ts.tv_sec = 0;
+    req.tv_sec = 0;
     // Sleep for at least 1000ns = 1us, but because of the scheduler, actually sleep for
     // some unknown amount of time greater than this. This isn't an RTOS!
-    ts.tv_nsec = 1000;
+    req.tv_nsec = 1000;
     if ((nanosleep(&req, &rem) == -1) && (errno == EINTR))
-        nanosleep(rem, NULL);
+        nanosleep(&rem, NULL);
 }
 
 #endif
@@ -631,32 +662,37 @@ static EPCError open_mutex(Mutex *mutex, String name) {
     EPCError err = EPC_OK;
 
     bool shmem_exists = false;
-    EPCError err =
-        open_shmem(&mutex->shmem, &name, sizeof(WrappedPosixMutex), &shmem_exists);
-    if (err != EPC_OK)
+    err = open_shmem(&mutex->shmem, name, sizeof(WrappedPosixMutex), &shmem_exists);
+    if (err.high)
         return err;
-    mutex->shared = (WrappedPosixMutex *)shmem.buf;
+    mutex->shared = (WrappedPosixMutex *)mutex->shmem.buf;
 
     // Allow other thread to initialize first.
     // If this does not happen, assume ownership and initialize it.
-    if (shmem_exists && (mutex->shared.initialized != INITIALIZED_CANARY)) {
+    if (shmem_exists && (mutex->shared->initialized != INITIALIZED_CANARY)) {
         short_nap();
     }
 
-    if (mutex->shared.initialized != INITIALIZED_CANARY) {
+    MEMORY_BARRIER;
+
+    if (mutex->shared->initialized != INITIALIZED_CANARY) {
         pthread_mutexattr_t attr;
-        if ((pthread_mutexattr_init(&attr) != 0) ||
-            (pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) != 0) ||
-            (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) != 0) ||
-            (pthread_mutex_init(&mutex->shared->mutex, &attr) != 0)) {
-            // Unset on error to allow other threads to try.
-            mutex->shared.initialized = 0;
-            err = error(SYS, MUTEX_OPEN);
-            close_shmem(mutex->shmem);
-            // Leak shared memory by not calling unlink. It will be collected by the
-            // server, or on restart if the server failed to initialize this.
+        if ((pthread_mutexattr_init(&attr) != 0)) {
+            if ((pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) != 0) ||
+                (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) != 0) ||
+                (pthread_mutex_init(&mutex->shared->mutex, &attr) != 0)) {
+                // Unset on error to allow other threads to try.
+                mutex->shared->initialized = 0;
+                err = error(SYS, MUTEX_OPEN);
+                close_shmem(mutex->shmem);
+                // Leak shared memory by not calling unlink. It will be collected by the
+                // server, or on restart if the server failed to initialize this.
+            } else {
+                mutex->shared->initialized = INITIALIZED_CANARY;
+            }
+            // Assume this cannot fail, and if it does it's not handleable.
+            pthread_mutexattr_destroy(&attr);
         }
-        mutex->shared.initialized = INITIALIZED_CANARY;
     }
 
     return err;
@@ -704,14 +740,21 @@ static EPCError wait_mutex(Mutex mutex, uint32_t timeout_ms) {
         return error(SYS, TIME);
     ts.tv_sec += timeout_ms / 1000;
     ts.tv_nsec += (timeout_ms % 1000) * 1000000;
-    int status = pthread_mutex_timedlock(&mutex.shared->mutex, &ts);
-    if (status == 0) {
-        return EPC_OK;
+    // Important: normalize tv_nsec to be less than 1,000,000,000
+    if (ts.tv_nsec >= ONE_BILLION) {
+        ts.tv_sec += (ts.tv_nsec / ONE_BILLION);
+        ts.tv_nsec %= ONE_BILLION;
     }
-    switch (errno) {
+    int status = pthread_mutex_timedlock(&mutex.shared->mutex, &ts);
+
+    switch (status) {
     case EOWNERDEAD: // Analogous to WAIT_ABANDONED in Win32.
         // WARNING: Unchecked error.
         pthread_mutex_consistent(&mutex.shared->mutex);
+#ifdef __GNUC__
+        __attribute__((fallthrough));
+#endif
+    case 0:
         return EPC_OK;
     case ETIMEDOUT:
         return error(POLL, TIMEOUT);
@@ -973,8 +1016,6 @@ static inline ptrdiff_t get_client_offset(ClientConnection *connection) {
     return connection->server_buf_size;
 }
 
-static const uint32_t INITIALIZED_CANARY = 0x12345678;
-
 typedef struct Server {
     Array_ClientConnection clients;
     int32_t next_serve_index; // A value of -1 should only happen if clients.len == 0
@@ -986,7 +1027,6 @@ typedef struct Server {
     Mutex join_mutex;
     ShmemBuffer join_shmem;
 
-    uint32_t initialized;
     uint16_t name_len;
     char name[];
 } Server;
@@ -995,7 +1035,6 @@ typedef struct Client {
     ClientConnection connection;
     Semaphore server_event_sem;
 
-    uint32_t initialized;
     uint16_t name_len;
     char name[];
 } Client;
@@ -1047,10 +1086,11 @@ static void sleep_ms(uint32_t time_ms) {
     Sleep(time_ms);
 #elif defined(EPC_POSIX)
     struct timespec req, rem;
-    ts.tv_sec = timeout_ms / 1000;
-    ts.tv_nsec = (timeout_ms % 1000) * 1000000;
-    if ((nanosleep(&req, &rem) == -1) && (errno == EINTR))
-        nanosleep(rem, NULL);
+    req.tv_sec = time_ms / 1000;
+    req.tv_nsec = (time_ms % 1000) * 1000000;
+    if ((nanosleep(&req, &rem) == -1) && (errno == EINTR)) {
+        nanosleep(&rem, NULL);
+    }
 #endif
 }
 
@@ -1099,14 +1139,6 @@ static void backoff_timeout(uint32_t timeout_ms, BackoffTimeout *backoff) {
         backoff->stage = get_next_backoff_stage(backoff->stage);
     }
 }
-
-#if defined(_MSC_VER)
-#define MEMORY_BARRIER MemoryBarrier()
-#elif defined(__GNUC__) || defined(__clang__)
-#define MEMORY_BARRIER __sync_synchronize()
-#else
-#error "Compiler does not support memory fence/barrier."
-#endif
 
 // ███████ ███████ ██████  ██    ██ ███████ ██████
 // ██      ██      ██   ██ ██    ██ ██      ██   ██
@@ -1188,6 +1220,7 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
         err = error(ARGS, IS_NULL);
         goto CLEANUP;
     }
+    server->value = 0;
 
     // Validate given name/address.
     if ((err = validate_shmem_name_external(name)).high)
@@ -1316,22 +1349,22 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
                             .server_header = EPC_HEADER,
                             .fixed_id = 0};
 
-    ptr->initialized = INITIALIZED_CANARY;
+    server->value = INITIALIZED_CANARY;
     server->internal = ptr;
 
     return err;
 
     // Error cleanup.
-    // cleanup_join_mutex_opened:
-    close_mutex(ptr->join_mutex);
 #ifdef EPC_POSIX
     err_cleanup = build_internal_obj_name(
         &(BuildNameParams){.name = name_str, .object_type_str = epc_prefix_join_lock},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (!err_cleanup.high) {
-        destroy_mutex(&ptr->join_mutex, str.bytes);
+        destroy_mutex(ptr->join_mutex, str.bytes);
     }
 #endif
+    close_mutex(ptr->join_mutex);
+
 cleanup_shmem_opened:
     close_shmem(ptr->join_shmem);
 #ifdef EPC_POSIX
@@ -1356,8 +1389,10 @@ cleanup_client_bitarray_alloced:
     BitArray_free(&ptr->client_ids);
 cleanup_client_array_alloced:
     Array_ClientConnection_free(&ptr->clients);
+#ifdef EPC_WINDOWS
 cleanup_win_address_used:
     windows_free_address(name_str);
+#endif
 cleanup_addr_mutex_locked:
     release_mutex(ptr->address_mutex);
 cleanup_addr_mutex_opened:
@@ -1536,7 +1571,7 @@ cleanup_client_sem_opened:
                            .object_type_str = epc_prefix_client_sem,
                            .fixed_id = connection.id},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (!err_cleanup)
+    if (!epc_error_ok(err_cleanup))
         destroy_semaphore(str.bytes);
 #endif
 cleanup_id_alloced:
@@ -1585,7 +1620,7 @@ static EPCError epc_server_disconnect_client(Server *ptr, uint32_t index,
                            .object_type_str = epc_prefix_client_sem,
                            .fixed_id = connection.id},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (!err_cleanup)
+    if (!epc_error_ok(err_cleanup))
         destroy_semaphore(str.bytes);
 #endif
     BitArray_unset_bit_unchecked(&ptr->client_ids, index);
@@ -1600,14 +1635,14 @@ EPCError epc_server_close(EPCServer *server) {
     (void)str;
     (void)err;
 
-    Server *ptr = server->internal;
-    String name_str = {.len = ptr->name_len, .bytes = ptr->name};
-
-    if (ptr == NULL)
+    if (server == NULL)
         return error(ARGS, IS_NULL);
 
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (server->value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    Server *ptr = server->internal;
+    String name_str = {.len = ptr->name_len, .bytes = ptr->name};
 
     // Let clients know that the server is not alive.
     ((volatile JoinArea *)ptr->join_shmem.buf)->server_alive = false;
@@ -1621,14 +1656,15 @@ EPCError epc_server_close(EPCServer *server) {
 
     // Close system resources.
 
-    close_mutex(ptr->join_mutex);
 #ifdef EPC_POSIX
     err = build_internal_obj_name(
         &(BuildNameParams){.name = name_str, .object_type_str = epc_prefix_join_lock},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
-    if (!err.high)
-        destroy_mutex(&ptr->join_mutex, str.bytes);
+    if (!err.high) {
+        destroy_mutex(ptr->join_mutex, str.bytes);
+    }
 #endif
+    close_mutex(ptr->join_mutex);
     close_shmem(ptr->join_shmem);
 #ifdef EPC_POSIX
     err = build_internal_obj_name(
@@ -1670,10 +1706,12 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
                                        EPC_OPTIONAL EPCClientID *client_id,
                                        EPCMessage *message, uint32_t requested_size,
                                        uint32_t timeout_ms) {
-    EPCError err = EPC_OK;
-    Server *ptr = server.internal;
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (server.value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    EPCError err = EPC_OK;
+
+    Server *ptr = server.internal;
     // This will be 0 on the first iteration, and non-zero otherwise.
     uint64_t last_time = 0;
 
@@ -1737,9 +1775,10 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
 }
 
 EPCError epc_server_end_recv(EPCServer server, EPCClientID client_id) {
-    Server *ptr = server.internal;
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (server.value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    Server *ptr = server.internal;
 
     int32_t connection_index = connection_index_from_id(&ptr->clients, client_id);
     if (connection_index == -1) {
@@ -1768,10 +1807,10 @@ EPCError epc_server_end_recv(EPCServer server, EPCClientID client_id) {
 
 EPCError epc_server_try_send(EPCServer server, EPCClientID client_id, EPCBuffer *buf,
                              uint32_t timeout_ms) {
-    Server *ptr = server.internal;
-
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (server.value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    Server *ptr = server.internal;
 
     int32_t connection_index = connection_index_from_id(&ptr->clients, client_id);
     if (connection_index == -1) {
@@ -1817,10 +1856,10 @@ ready:
 
 EPCError epc_server_end_send(EPCServer server, EPCClientID client_id,
                              uint32_t message_size) {
-    Server *ptr = server.internal;
-
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (server.value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    Server *ptr = server.internal;
 
     int32_t connection_index = connection_index_from_id(&ptr->clients, client_id);
     if (connection_index == -1) {
@@ -1873,6 +1912,7 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_si
         err = error(ARGS, IS_NULL);
         goto CLEANUP;
     }
+    client->value = 0;
 
     // Validate given name/address.
     if ((err = validate_shmem_name_external(name)).high)
@@ -2055,7 +2095,7 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_si
     // Indicate to server that the client area has been initialized.
     join_area->client_ready = true;
 
-    ptr->initialized = INITIALIZED_CANARY;
+    client->value = INITIALIZED_CANARY;
     client->internal = ptr;
 
     // Release the mutex and close it. Also close join shmem.
@@ -2100,13 +2140,13 @@ static void epc_client_disconnect_(Client *client, SharedTurn turn) {
 }
 
 EPCError epc_client_disconnect(EPCClient *client) {
-    Client *ptr = client->internal;
-
-    if (ptr == NULL)
+    if (client == NULL)
         return error(ARGS, IS_NULL);
 
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (client->value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    Client *ptr = client->internal;
 
     epc_client_disconnect_(ptr, TURN_CLOSE);
 
@@ -2116,10 +2156,11 @@ EPCError epc_client_disconnect(EPCClient *client) {
 }
 
 EPCError epc_client_try_recv(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms) {
+    if (client.value != INITIALIZED_CANARY)
+        return error(ARGS, NOT_INITIALIZED);
+
     EPCError err = EPC_OK;
     Client *ptr = client.internal;
-    if (ptr->initialized != INITIALIZED_CANARY)
-        return error(ARGS, NOT_INITIALIZED);
     volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
     uint64_t last_time = 0;
 
@@ -2165,9 +2206,10 @@ ready:
     return EPC_OK;
 }
 EPCError epc_client_end_recv(EPCClient client) {
-    Client *ptr = client.internal;
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (client.value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    Client *ptr = client.internal;
     volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
 
     switch (shared->server.turn) {
@@ -2187,9 +2229,10 @@ EPCError epc_client_end_recv(EPCClient client) {
     }
 }
 EPCError epc_client_try_send(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms) {
-    Client *ptr = client.internal;
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (client.value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    Client *ptr = client.internal;
     volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
     uint64_t last_time = 0;
     BackoffTimeout backoff = (BackoffTimeout){0};
@@ -2227,9 +2270,10 @@ ready:
 }
 
 EPCError epc_client_end_send(EPCClient client, uint32_t message_size) {
-    Client *ptr = client.internal;
-    if (ptr->initialized != INITIALIZED_CANARY)
+    if (client.value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
+
+    Client *ptr = client.internal;
     if (message_size > ptr->connection.client_buf_size)
         return error(ARGS, MESSAGE_TOO_LARGE);
     volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;

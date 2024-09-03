@@ -1,5 +1,21 @@
 // Read data from stdin and send data to stdout.
 
+#ifdef _WIN32
+#define EPC_WINDOWS
+#include <Windows.h>
+#else
+#define EPC_POSIX
+
+#define _POSIX_C_SOURCE 200809L
+#define _GNU_SO
+
+#include <errno.h>
+#include <fcntl.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#endif
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -9,18 +25,6 @@
 
 #include "epicac.h"
 #include <ctype.h>
-
-#ifdef _WIN32
-#define EPC_WINDOWS
-#include <Windows.h>
-#else
-#define EPC_POSIX
-#include <fcntl.h>
-#include <semaphore.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <time.h>
-#endif
 
 static const uint32_t DEFAULT_BUFFER_SIZE = 4096;
 static const uint32_t DEFAULT_MESSAGE_SIZE = 4096;
@@ -40,7 +44,7 @@ const char *program_name = PROGRAM_NAME;
 #define USAGE_ERROR(...)                                                                 \
     do {                                                                                 \
         fprintf(stderr, PROGRAM_NAME ": "__VA_ARGS__);                                   \
-        fprintf(stderr, usage_string);                                                   \
+        fprintf(stderr, "Try '" PROGRAM_NAME " --help' for more information.\n");        \
         exit(2);                                                                         \
     } while (0);
 
@@ -51,14 +55,13 @@ const char *program_name = PROGRAM_NAME;
         exit(2);                                                                         \
     } while (0);
 
-#define USAGE_STRING "Usage: epicat [--listen/-l] [--buffer-size/-b SIZE] ADDRESS\n"
+#define USAGE_STRING "Usage: " PROGRAM_NAME " [OPTIONS...] ADDRESS\n"
 
-static const char *usage_string = USAGE_STRING;
 static const char *help_string = USAGE_STRING
     "Send messages from standard input to an epicac peer, and receive to standard "
     "output.\n"
-    "Example to open a server on address 'foo_bar': epicat -l foo_bar\n"
-    "ADDRESS is a string not containing forwards slashes.\n"
+    "Example to open a server on address 'foo_bar': " PROGRAM_NAME " -l foo_bar\n"
+    "ADDRESS is a string not containing forwards / or backwards \\ slashes.\n"
     "  -l, --listen            start a server instead of a client\n"
     "  -b, --buffer-size=NUM   use an internal IO buffer of size NUM bytes\n"
     "  -m, --message-size=NUM  use an internal max message size of NUM bytes\n"
@@ -157,12 +160,12 @@ static inline void parse_arg(const ArgDefinition *arg_def, EpicatArgs *args,
     } else if (arg_def->type == ARG_TYPE_UINT32) {
         char *end = NULL;
         errno = 0;
-        uint64_t value = strtoll(arg_value, &end, 0);
+        int64_t value = strtoll(arg_value, &end, 0);
         if (isspace(arg_value[0]) || *end != '\0') {
             USAGE_ERROR("argument for %s/-%c '%s' is not a valid integer\n",
                         arg_def->name, arg_def->char_, arg_value);
         }
-        if (errno == ERANGE || value > UINT32_MAX) {
+        if (errno == ERANGE || value > UINT32_MAX || value < 0) {
             USAGE_ERROR("argument for %s/-%c '%s' is out of range\n", arg_def->name,
                         arg_def->char_, arg_value);
         }
@@ -309,23 +312,23 @@ static inline void parse_args(int argc, char *argv[], EpicatArgs *args) {
 // ██      ██      ██ ██      ██  ██ ██    ██
 //  ██████ ███████ ██ ███████ ██   ████    ██
 
-int epicat_client(EpicatArgs *args) {
-    HANDLE windows_stdin = GetStdHandle(STD_INPUT_HANDLE);
-    if (windows_stdin == INVALID_HANDLE_VALUE) {
-        EPICAT_ERROR("GetStdHandle() for stdin was invalid");
-        return 1;
-    }
+// int epicat_client(EpicatArgs *args) {
+//     HANDLE windows_stdin = GetStdHandle(STD_INPUT_HANDLE);
+//     if (windows_stdin == INVALID_HANDLE_VALUE) {
+//         EPICAT_ERROR("GetStdHandle() for stdin was invalid");
+//         return 1;
+//     }
 
-    char *buffer = malloc(sizeof(char) * args->buffer_size);
+//     char *buffer = malloc(sizeof(char) * args->buffer_size);
 
-    while (fgets(buffer, args->buffer_size, stdin) != NULL) {
-        if (fputs(buffer, stdout) == EOF) {
-            perror(PROGRAM_NAME ": fwrite");
-        }
-    };
+//     while (fgets(buffer, args->buffer_size, stdin) != NULL) {
+//         if (fputs(buffer, stdout) == EOF) {
+//             perror(PROGRAM_NAME ": fwrite");
+//         }
+//     };
 
-    return 0;
-}
+//     return 0;
+// }
 
 int main(int argc, char *argv[]) {
     EpicatArgs args;

@@ -34,6 +34,7 @@ recv()
 #define EPC_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define EPC_VERSION_MAJOR 0
 #define EPC_VERSION_MINOR 0
@@ -128,9 +129,11 @@ int epc_error_not_ok(EPCError error);
 
 typedef struct {
     void *internal;
+    uint32_t value;
 } EPCClient;
 typedef struct {
     void *internal;
+    uint32_t value;
 } EPCServer;
 
 typedef struct {
