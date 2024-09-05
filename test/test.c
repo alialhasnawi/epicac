@@ -93,6 +93,18 @@
         }                                                                                \
     } while (0)
 
+#define EPC_ASSERT_ERR_THREAD(error_message, epc_error, expected_error)                  \
+    do {                                                                                 \
+        EPCError e = epc_error;                                                          \
+        if (!err_eq(e, expected_error)) {                                                \
+            *args_->result =                                                             \
+                (TestResult){.failure = true,                                            \
+                             .message = epc_err_to_string(                               \
+                                 error_message " (expected " #expected_error ")", e)};   \
+            return;                                                                      \
+        }                                                                                \
+    } while (0)
+
 static inline char *epc_err_to_string(const char *message, EPCError err) {
     const char *high_desc = epc_error_high_description(err);
     const char *low_desc = epc_error_low_description(err);
@@ -128,7 +140,7 @@ static inline bool err_eq(EPCError x, EPCError y) {
             exit(1);                                                                     \
         } else {                                                                         \
             tests_passed++;                                                              \
-            printf(".");                                                                 \
+            fprintf(stderr, ".");                                                        \
         }                                                                                \
     } while (0)
 
@@ -270,7 +282,7 @@ typedef struct ThreadFunctionArgs {
 
 #ifdef EPC_WINDOWS
 static DWORD thread_function_wrapper(void *args) {
-    ThreadFunctionArgs args_ = (ThreadFunctionArgs *)args;
+    ThreadFunctionArgs *args_ = (ThreadFunctionArgs *)args;
     args_->function(args_->arg);
     free(args);
     return 0;
@@ -456,8 +468,6 @@ static void test_client_send_client_thread(void *args) {
     EPC_ASSERT_THREAD("epc_client_try_send",
                       epc_client_end_send(client, sizeof(test_message)));
 
-    sleep_ms(30000);
-
     TEST_CLIENT_CLOSE
 }
 
@@ -473,12 +483,52 @@ static TestResult test_client_send() {
 
     EPC_ASSERT_ERR(
         "epc_server_try_recv_or_accept (recv)",
-        epc_server_try_recv_or_accept(server, &client_id, &message, requested_size, 5000),
+        epc_server_try_recv_or_accept(server, &client_id, &message, requested_size, 1000),
         error(OK, GOT_MESSAGE));
     ASSERT("message size is correct", message.len == sizeof(test_message));
     char *message_ = (char *)message.buf;
     ASSERT("message not null", message_ != NULL);
     ASSERT("message not corrupted", !strcmp(message_, test_message));
+
+    TEST_SERVER_CLOSE_WITH_CLIENT
+}
+
+static void test_server_send_client_thread(void *args) {
+    TEST_CLIENT_OPEN
+
+    EPCMessage message = {.buf = NULL};
+    EPC_ASSERT_THREAD("epc_client_try_recv", epc_client_try_recv(client, &message, 1000));
+    ASSERT_THREAD("message size is correct", message.len == sizeof(test_message));
+    char *message_ = (char *)message.buf;
+    ASSERT_THREAD("message not null", message_ != NULL);
+    ASSERT_THREAD("message not corrupted", !strcmp(message_, test_message));
+
+    TEST_CLIENT_CLOSE
+}
+
+static TestResult test_server_send() {
+    TEST_SERVER_OPEN_WITH_CLIENT(test_server_send_client_thread)
+
+    EPCClientID client_id;
+    EPCMessage message = {.buf = NULL};
+    EPC_ASSERT_ERR(
+        "epc_server_try_recv_or_accept (accept)",
+        epc_server_try_recv_or_accept(server, &client_id, &message, requested_size, 1000),
+        error(OK, ACCEPTED));
+
+    EPCBuffer buffer = {.buf = NULL};
+    EPC_ASSERT("epc_server_try_send",
+               epc_server_try_send(server, client_id, &buffer, 1000));
+
+    ASSERT("buffer is set", buffer.buf != NULL);
+    ASSERT("buffer requested size is respected", buffer.size == requested_size);
+
+    buffer.buf[0] = 0;
+    char *buf_ = (char *)buffer.buf;
+    strcat(buf_, test_message);
+
+    EPC_ASSERT("epc_server_end_send",
+               epc_server_end_send(server, client_id, sizeof(test_message)));
 
     TEST_SERVER_CLOSE_WITH_CLIENT
 }
@@ -492,8 +542,9 @@ static void all_tests() {
     RUN_TEST(test_client_timeout);
     RUN_TEST(test_basic_connect);
     RUN_TEST(test_client_send);
+    RUN_TEST(test_server_send);
 
-    printf("\n");
+    fprintf(stderr, "\n");
 }
 
 int main(int argc, char **argv) {
@@ -507,17 +558,17 @@ int main(int argc, char **argv) {
 
     uint64_t start_time = monotonic_time_ms();
 
-    printf("========================================\n");
+    fprintf(stderr, "========================================\n");
 
     all_tests();
 
-    printf("%d tests run.\n", tests_run);
+    fprintf(stderr, "%d tests run.\n", tests_run);
     if (tests_run == tests_passed) {
-        printf("All tests passed in %.2fs.\n",
-               (float)(monotonic_time_ms() - start_time) / 1000.0f);
+        fprintf(stderr, "All tests passed in %.2fs.\n",
+                (float)(monotonic_time_ms() - start_time) / 1000.0f);
     }
 
-    printf("========================================\n");
+    fprintf(stderr, "========================================\n");
 
     destroy_mutex();
 

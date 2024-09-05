@@ -33,8 +33,8 @@ recv()
 #ifndef EPC_H
 #define EPC_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define EPC_VERSION_MAJOR 0
 #define EPC_VERSION_MINOR 0
@@ -175,7 +175,7 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_si
                             uint32_t timeout_ms);
 EPCError epc_client_disconnect(EPCClient *client);
 
-EPCError epc_client_try_recv(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms);
+EPCError epc_client_try_recv(EPCClient client, EPCMessage *buf, uint32_t timeout_ms);
 EPCError epc_client_end_recv(EPCClient client);
 EPCError epc_client_try_send(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms);
 EPCError epc_client_end_send(EPCClient client, uint32_t message_size);

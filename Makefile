@@ -1,18 +1,30 @@
+INC_DIRS := ./lib
+
 ifeq ($(OS), Windows_NT)
 EXE_SUFFIX := .exe
 WINDOWS := 1
-CC := cl.exe
-INC_DIRS := ./lib
-INC_FLAGS := $(addprefix /I,$(INC_DIRS))
-CFLAGS ?= $(INC_FLAGS)
-ifneq ($(DEBUG),)
-CFLAGS := $(CFLAGS) /Zi /fsanitize=address
+
+ifdef MSCV
+  CC := cl.exe
+  INC_FLAGS := $(addprefix /I,$(INC_DIRS))
+  CFLAGS ?= $(INC_FLAGS)
+  ifneq ($(DEBUG),)
+  CFLAGS := $(CFLAGS) /Zi /fsanitize=address
+  endif
+else
+  CC := gcc
+  INC_FLAGS := $(addprefix -I,$(INC_DIRS))
+  CFLAGS ?= $(INC_FLAGS) -O2 -Wall -Wextra -Werror -std=c11 -pedantic
+  ifneq ($(DEBUG),)
+  CFLAGS := $(CFLAGS) -g -Og -fsanitize=address
+  LDFLAGS := $(LDFLAGS) -fsanitize=address -static-libasan
+  endif
 endif
+
 else
 CC := gcc
-INC_DIRS := ./lib
 INC_FLAGS := $(addprefix -I,$(INC_DIRS))
-CFLAGS ?= $(INC_FLAGS) -g -Og -Wall -Wextra -Werror -std=c11 -pedantic
+CFLAGS ?= $(INC_FLAGS) -O2 -Wall -Wextra -Werror -std=c11 -pedantic
 ifneq ($(DEBUG),)
 CFLAGS := $(CFLAGS) -g -Og -fsanitize=address
 LDFLAGS := $(LDFLAGS) -fsanitize=address -static-libasan
@@ -28,7 +40,7 @@ OBJS := $(SRCS:%=$(BUILD_DIR)/%.o)
 
 EPICAT_EXE := $(BUILD_DIR)/epicat$(EXE_SUFFIX)
 epicat: $(EPICAT_EXE)
-ifdef WINDOWS
+ifdef MSCV
 $(EPICAT_EXE): ./lib/epicac.c ./cli/main.c
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $^ /link /out:$@
@@ -41,7 +53,7 @@ TEST_EXE := $(BUILD_DIR)/test_main$(EXE_SUFFIX)
 test: $(TEST_EXE)
 	$(TEST_EXE)
 
-ifdef WINDOWS
+ifdef MSCV
 $(TEST_EXE): ./lib/epicac.c ./test/test.c
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $^ /link /out:$@

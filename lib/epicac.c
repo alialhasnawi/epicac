@@ -976,6 +976,7 @@ typedef struct JoinArea {
     EPCHeader server_header; // Should be set to EPC_HEADER by server.
     EPCHeader client_header; // Should be set to EPC_HEADER by client.
     uint32_t fixed_id;       // Server writable, client readable.
+    uint32_t dynamic_id;     // Server writable, client readable.
     uint32_t client_size;    // Client writable, server readable.
     uint32_t server_size;    // Server writable, client readable.
     uint64_t shmem_size;     // Server writable, client readable.
@@ -1347,7 +1348,8 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
                             .server_ready = false,
                             .abort = false,
                             .server_header = EPC_HEADER,
-                            .fixed_id = 0};
+                            .fixed_id = 0,
+                            .dynamic_id = 0};
 
     server->value = INITIALIZED_CANARY;
     server->internal = ptr;
@@ -1404,7 +1406,13 @@ cleanup_nothing:
 }
 
 static thread_local uint32_t last_num = 0;
-uint32_t id32() { return last_num++; }
+uint32_t id32() {
+    last_num++;
+    if (last_num == 0) {
+        last_num++;
+    }
+    return last_num;
+}
 
 static inline EPCClientID id_from_connection(ClientConnection *connection) {
     return (EPCClientID){(((uint64_t)connection->id) << 32) | connection->dynamic_id};
@@ -1473,7 +1481,8 @@ static EPCError epc_server_accept(Server *ptr, EPCClientID *client_id,
     err = build_internal_obj_name(
         &(BuildNameParams){.name = name_str,
                            .object_type_str = epc_prefix_client_sem,
-                           .fixed_id = connection.id},
+                           .fixed_id = connection.id,
+                           .dynamic_id = connection.dynamic_id},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (err.high)
         goto CLEANUP;
@@ -1514,6 +1523,7 @@ static EPCError epc_server_accept(Server *ptr, EPCClientID *client_id,
     join_area->server_size = connection.server_buf_size;
     join_area->shmem_size = shmem_size;
     join_area->fixed_id = connection.id;
+    join_area->dynamic_id = connection.dynamic_id;
     join_area->client_ready = false;
     MEMORY_BARRIER;
     join_area->server_ready = true;
@@ -1569,7 +1579,8 @@ cleanup_client_sem_opened:
     err_cleanup = build_internal_obj_name(
         &(BuildNameParams){.name = name_str,
                            .object_type_str = epc_prefix_client_sem,
-                           .fixed_id = connection.id},
+                           .fixed_id = connection.id,
+                           .dynamic_id = join_area->dynamic_id},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (!epc_error_ok(err_cleanup))
         destroy_semaphore(str.bytes);
@@ -1618,7 +1629,8 @@ static EPCError epc_server_disconnect_client(Server *ptr, uint32_t index,
     err_cleanup = build_internal_obj_name(
         &(BuildNameParams){.name = name_str,
                            .object_type_str = epc_prefix_client_sem,
-                           .fixed_id = connection.id},
+                           .fixed_id = connection.id,
+                           .dynamic_id = connection.dynamic_id},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (!epc_error_ok(err_cleanup))
         destroy_semaphore(str.bytes);
@@ -1739,22 +1751,36 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
             uint8_t client_turn = shared->client.turn;
 
             // Kill error/client-side killed connections.
-            if (client_turn == TURN_CLOSE || client_turn == TURN_ERROR) {
+            if (client_turn == TURN_ERROR) {
                 epc_server_disconnect_client(ptr, i, client_turn);
             }
 
             // Handle incoming messages.
-            else if (client_turn == TURN_RECEIVER) {
+            // Also handle a message left over after the client disconnects.
+            else if (client_turn == TURN_CLOSE || client_turn == TURN_RECEIVER) {
                 MEMORY_BARRIER;
+                size_t message_size = shared->client.message_size;
+
+                // The message has already been delivered to the caller before.
+                if (client_turn == TURN_CLOSE && message_size == 0) {
+                    epc_server_disconnect_client(ptr, i, client_turn);
+                    continue;
+                }
+
                 *message =
                     (EPCMessage){.len = shared->client.message_size,
                                  .buf = shared->buf + get_client_offset(connection)};
-                // Either way, next_serve_index >= 0 after this.
+                shared->client.message_size = 0;
+
+                // Either way, len > next_serve_index >= 0 after this.
                 if (i <= 0) {
+                    // Loop back around to end of list.
                     ptr->next_serve_index = (int32_t)(connections->len & INT32_MAX) - 1;
                 } else {
+                    // Decrement normally.
                     ptr->next_serve_index = i - 1;
                 }
+
                 return error(OK, GOT_MESSAGE);
             }
         }
@@ -2057,6 +2083,7 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_si
     ptr->connection = (ClientConnection){.client_buf_size = join_area->client_size,
                                          .server_buf_size = join_area->server_size,
                                          .id = join_area->fixed_id,
+                                         .dynamic_id = join_area->dynamic_id,
                                          .last_response_time_ms = monotonic_time_ms()};
     uint64_t shmem_size = join_area->shmem_size;
 
@@ -2070,7 +2097,8 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_si
     err = build_internal_obj_name(
         &(BuildNameParams){.name = name_str,
                            .object_type_str = epc_prefix_client_sem,
-                           .fixed_id = ptr->connection.id},
+                           .fixed_id = ptr->connection.id,
+                           .dynamic_id = ptr->connection.dynamic_id},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (err.high)
         goto CLEANUP;
@@ -2081,11 +2109,10 @@ EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_si
 #define CLEANUP cleanup_client_sem_opened
 
     err = build_internal_obj_name(
-        &(BuildNameParams){
-            .name = name_str,
-            .object_type_str = epc_prefix_shmem,
-            .fixed_id = ptr->connection.id,
-        },
+        &(BuildNameParams){.name = name_str,
+                           .object_type_str = epc_prefix_shmem,
+                           .fixed_id = ptr->connection.id,
+                           .dynamic_id = ptr->connection.dynamic_id},
         &str, shmem_string_scratch, SHMEM_SCRATCH_SIZE);
     if (err.high)
         goto CLEANUP;
@@ -2155,7 +2182,7 @@ EPCError epc_client_disconnect(EPCClient *client) {
     return EPC_OK;
 }
 
-EPCError epc_client_try_recv(EPCClient client, EPCBuffer *buf, uint32_t timeout_ms) {
+EPCError epc_client_try_recv(EPCClient client, EPCMessage *buf, uint32_t timeout_ms) {
     if (client.value != INITIALIZED_CANARY)
         return error(ARGS, NOT_INITIALIZED);
 
@@ -2183,6 +2210,9 @@ EPCError epc_client_try_recv(EPCClient client, EPCBuffer *buf, uint32_t timeout_
             goto ready;
 
         case TURN_CLOSE:
+            if (shared->server.message_size != 0) {
+                goto ready;
+            }
             return error(IPC, CLOSED);
         case TURN_ERROR:
             return error(IPC, SERVER);
@@ -2201,7 +2231,8 @@ ready:
     // }
     // shared->server.canary = 0;
     buf->buf = shared->buf + get_server_offset(&ptr->connection);
-    buf->size = shared->server.message_size;
+    buf->len = shared->server.message_size;
+    shared->server.message_size = 0;
 
     return EPC_OK;
 }
@@ -2283,8 +2314,10 @@ EPCError epc_client_end_send(EPCClient client, uint32_t message_size) {
         shared->client.message_size = message_size;
         MEMORY_BARRIER;
         shared->client.turn = TURN_RECEIVER;
-        // NOTE: Unchecked error.
-        post_semaphore(ptr->server_event_sem);
+        EPCError err;
+        if (epc_error_not_ok(err = post_semaphore(ptr->server_event_sem))) {
+            return err;
+        }
         return EPC_OK;
     case TURN_RECEIVER:
         return error(IPC, OUT_OF_ORDER);
