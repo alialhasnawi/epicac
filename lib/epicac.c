@@ -289,6 +289,13 @@ static inline void base64_encode(uint32_t value, char buffer[EPC_FIXED_ID_LEN]) 
     }
 }
 
+/// @brief Catenate `len` chars from `addition` onto `buf` starting at index `start`
+/// @param buf
+/// @param start
+/// @param len
+/// @param addition
+/// @return 1 + the index of the `len`'th char added. i.e. the `start` for a subsequent
+/// call to `cat`
 static inline size_t cat(char *buf, uint16_t start, uint16_t len, const char *addition) {
     int i = 0;
     for (; i < len; ++i)
@@ -1781,6 +1788,10 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
                     ptr->next_serve_index = i - 1;
                 }
 
+                if (message_size == 0) {
+                    return error(IPC, OUT_OF_ORDER);
+                }
+
                 return error(OK, GOT_MESSAGE);
             }
         }
@@ -1823,7 +1834,10 @@ EPCError epc_server_end_recv(EPCServer server, EPCClientID client_id) {
         return error(IPC, OUT_OF_ORDER);
 
     case TURN_CLOSE:
-        return error(IPC, CLOSED);
+        // TODO: verify if this behaviour is wanted.
+        // Ending a receive to a closed peer should not error out.
+        // return error(IPC, CLOSED);
+        return EPC_OK;
     case TURN_ERROR:
         return error(IPC, CLIENT);
     default:
@@ -1882,8 +1896,13 @@ ready:
 
 EPCError epc_server_end_send(EPCServer server, EPCClientID client_id,
                              uint32_t message_size) {
-    if (server.value != INITIALIZED_CANARY)
+    if (server.value != INITIALIZED_CANARY) {
         return error(ARGS, NOT_INITIALIZED);
+    }
+
+    if (message_size == 0) {
+        return error(ARGS, INVALID_MESSAGE_SIZE);
+    }
 
     Server *ptr = server.internal;
 
@@ -1892,8 +1911,9 @@ EPCError epc_server_end_send(EPCServer server, EPCClientID client_id,
         return error(ARGS, ID);
     }
     ClientConnection *connection = &ptr->clients.slice[connection_index];
-    if (message_size > connection->server_buf_size)
+    if (message_size > connection->server_buf_size) {
         return error(ARGS, MESSAGE_TOO_LARGE);
+    }
 
     volatile SharedBuffer *shared = (volatile SharedBuffer *)connection->shmem.buf;
 
@@ -2190,9 +2210,11 @@ EPCError epc_client_try_recv(EPCClient client, EPCMessage *buf, uint32_t timeout
     Client *ptr = client.internal;
     volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
     uint64_t last_time = 0;
+    uint8_t turn;
 
     while (true) {
-        switch (shared->server.turn) {
+        turn = shared->server.turn;
+        switch (turn) {
         case TURN_SENDER:
             if (!last_time) {
                 last_time = monotonic_time_ms();
@@ -2210,10 +2232,7 @@ EPCError epc_client_try_recv(EPCClient client, EPCMessage *buf, uint32_t timeout
             goto ready;
 
         case TURN_CLOSE:
-            if (shared->server.message_size != 0) {
-                goto ready;
-            }
-            return error(IPC, CLOSED);
+            goto ready;
         case TURN_ERROR:
             return error(IPC, SERVER);
         default:
@@ -2230,6 +2249,19 @@ ready:
     //     return error(IPC, SERVER);
     // }
     // shared->server.canary = 0;
+
+    size_t message_size = shared->server.message_size;
+
+    if (message_size == 0) {
+        if (turn == TURN_CLOSE) {
+            return error(IPC, CLOSED);
+        } else if (turn == TURN_RECEIVER) {
+            return error(IPC, OUT_OF_ORDER);
+        } else {
+            assert(false);
+        }
+    }
+
     buf->buf = shared->buf + get_server_offset(&ptr->connection);
     buf->len = shared->server.message_size;
     shared->server.message_size = 0;
@@ -2252,7 +2284,10 @@ EPCError epc_client_end_recv(EPCClient client) {
         return error(IPC, OUT_OF_ORDER);
 
     case TURN_CLOSE:
-        return error(IPC, CLOSED);
+        // TODO: verify if this behaviour is wanted.
+        // Ending a receive to a closed peer should not error out.
+        // return error(IPC, CLOSED);
+        return EPC_OK;
     case TURN_ERROR:
         return error(IPC, SERVER);
     default:
@@ -2301,12 +2336,18 @@ ready:
 }
 
 EPCError epc_client_end_send(EPCClient client, uint32_t message_size) {
-    if (client.value != INITIALIZED_CANARY)
+    if (client.value != INITIALIZED_CANARY) {
         return error(ARGS, NOT_INITIALIZED);
+    }
+
+    if (message_size == 0) {
+        return error(ARGS, INVALID_MESSAGE_SIZE);
+    }
 
     Client *ptr = client.internal;
-    if (message_size > ptr->connection.client_buf_size)
+    if (message_size > ptr->connection.client_buf_size) {
         return error(ARGS, MESSAGE_TOO_LARGE);
+    }
     volatile SharedBuffer *shared = (volatile SharedBuffer *)ptr->connection.shmem.buf;
 
     switch (shared->client.turn) {

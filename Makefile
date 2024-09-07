@@ -62,6 +62,19 @@ $(TEST_EXE): $(OBJS) $(BUILD_DIR)/test/test.c.o
 	$(CC) $^ -o $@ $(LDFLAGS)
 endif
 
+BENCH_EXE := $(BUILD_DIR)/bench_main$(EXE_SUFFIX)
+bench: $(BENCH_EXE)
+	$(BENCH_EXE)
+
+ifdef MSCV
+$(BENCH_EXE): ./lib/epicac.c ./test/bench.c
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $^ /link /out:$@
+else
+$(BENCH_EXE): $(OBJS) $(BUILD_DIR)/test/bench.c.o
+	$(CC) $^ -o $@ $(LDFLAGS)
+endif
+
 MEOW_EXE := $(BUILD_DIR)/meow$(EXE_SUFFIX)
 meow: $(MEOW_EXE)
 $(MEOW_EXE): $(OBJS) $(BUILD_DIR)/meow.c.o
