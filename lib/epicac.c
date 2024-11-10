@@ -1024,6 +1024,12 @@ static inline ptrdiff_t get_client_offset(ClientConnection *connection) {
     return connection->server_buf_size;
 }
 
+typedef struct ServerSettings {
+    uint32_t keep_alive_ms;
+} ServerSettings;
+
+static const ServerSettings DEFAULT_SERVER_SETTINGS = {.keep_alive_ms = 1000 * 60 * 60};
+
 typedef struct Server {
     Array_ClientConnection clients;
     int32_t next_serve_index; // A value of -1 should only happen if clients.len == 0
@@ -1034,6 +1040,8 @@ typedef struct Server {
 
     Mutex join_mutex;
     ShmemBuffer join_shmem;
+
+    ServerSettings settings;
 
     uint16_t name_len;
     char name[];
@@ -1216,7 +1224,7 @@ static inline EPCError windows_free_address(String address) {
 }
 #endif
 
-EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
+EPCError epc_server_bind(EPCServer *server, const char *name, uint32_t timeout_ms) {
     EPCError err = EPC_OK;
     EPCError err_cleanup = EPC_OK;
     (void)err_cleanup;
@@ -1241,6 +1249,8 @@ EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms) {
         err = error(SYS, MALLOC);
         goto CLEANUP;
     }
+
+    ptr->settings = DEFAULT_SERVER_SETTINGS;
 
 #undef CLEANUP
 #define CLEANUP cleanup_server_alloced
@@ -1732,7 +1742,7 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
 
     Server *ptr = server.internal;
     // This will be 0 on the first iteration, and non-zero otherwise.
-    uint64_t last_time = 0;
+    uint64_t last_time = monotonic_time_ms();
 
     Array_ClientConnection *connections = &ptr->clients;
 
@@ -1758,7 +1768,9 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
             uint8_t client_turn = shared->client.turn;
 
             // Kill error/client-side killed connections.
-            if (client_turn == TURN_ERROR) {
+            if (client_turn == TURN_ERROR ||
+                (last_time - connection->last_response_time_ms >
+                 ptr->settings.keep_alive_ms)) {
                 epc_server_disconnect_client(ptr, i, client_turn);
             }
 
@@ -1791,6 +1803,9 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
                 if (message_size == 0) {
                     return error(IPC, OUT_OF_ORDER);
                 }
+
+                connection->last_response_time_ms =
+                    last_time ? last_time : monotonic_time_ms();
 
                 return error(OK, GOT_MESSAGE);
             }
@@ -1888,6 +1903,7 @@ EPCError epc_server_try_send(EPCServer server, EPCClientID client_id, EPCBuffer 
 
 ready:
     // By now, server.turn must be TURN_SENDER.
+    connection->last_response_time_ms = last_time ? last_time : monotonic_time_ms();
     buf->buf = shared->buf + get_server_offset(connection);
     buf->size = connection->server_buf_size;
 
@@ -1943,7 +1959,7 @@ EPCError epc_server_end_send(EPCServer server, EPCClientID client_id,
 // ██      ██      ██ ██      ██  ██ ██    ██
 //  ██████ ███████ ██ ███████ ██   ████    ██
 
-EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_size,
+EPCError epc_client_connect(EPCClient *client, const char *name, uint32_t requested_size,
                             uint32_t timeout_ms) {
     uint64_t last_time = monotonic_time_ms();
 
@@ -2262,6 +2278,7 @@ ready:
         }
     }
 
+    ptr->connection.last_response_time_ms = last_time ? last_time : monotonic_time_ms();
     buf->buf = shared->buf + get_server_offset(&ptr->connection);
     buf->len = shared->server.message_size;
     shared->server.message_size = 0;
@@ -2329,6 +2346,7 @@ EPCError epc_client_try_send(EPCClient client, EPCBuffer *buf, uint32_t timeout_
 
 ready:
     // By now, client.turn must be TURN_SENDER.
+    ptr->connection.last_response_time_ms = last_time ? last_time : monotonic_time_ms();
     buf->buf = shared->buf + get_client_offset(&ptr->connection);
     buf->size = ptr->connection.client_buf_size;
 

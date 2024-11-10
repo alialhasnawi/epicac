@@ -262,7 +262,6 @@ static void join_thread(const Thread thread) {
 //    ██    ██           ██    ██         ██
 //    ██    ███████ ███████    ██    ███████
 
-static const uint32_t requested_size = 2048;
 static uint32_t roundtrip_count = 1000000;
 static double max_accepted_rtt_ms = 0.01;
 
@@ -308,6 +307,8 @@ const char test_message[] =
     "epicac!hello epicac!hello epicac!hello epicac!hello epicac!hello epicac!hello "
     "epicac!hello epicac!hello epicac!hello epicac!hello epicac!hello epicac!hello "
     "epicac!hello epi";
+
+static const uint32_t requested_size = sizeof(test_message);
 
 static void test_client_send_client_thread(void *args) {
     TEST_CLIENT_OPEN

@@ -155,7 +155,7 @@ typedef struct EPCMessage {
 /**
  * Create a new server socket to listen to new connections.
  */
-EPCError epc_server_bind(EPCServer *server, char *name, uint32_t timeout_ms);
+EPCError epc_server_bind(EPCServer *server, const char *name, uint32_t timeout_ms);
 EPCError epc_server_close(EPCServer *server);
 
 EPCError epc_server_try_recv_or_accept(EPCServer server,
@@ -171,7 +171,7 @@ EPCError epc_server_end_send(EPCServer server, EPCClientID client_id,
 /**
  * Create a new client socket and connect to a server.
  */
-EPCError epc_client_connect(EPCClient *client, char *name, uint32_t requested_size,
+EPCError epc_client_connect(EPCClient *client, const char *name, uint32_t requested_size,
                             uint32_t timeout_ms);
 EPCError epc_client_disconnect(EPCClient *client);
 

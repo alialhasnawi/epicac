@@ -222,6 +222,7 @@ static void init_mutex() {
         (pthread_mutex_init(&global_mutex, &attr) != 0)) {
         TEST_PERROR("pthread_mutex_init");
     }
+    pthread_mutexattr_destroy(&global_mutex);
 #endif
 }
 
@@ -418,10 +419,10 @@ typedef struct SubthreadArgs {
     random_address(address);                                                             \
     Thread client;                                                                       \
     TestResult client_result = {0};                                                      \
-    start_thread(&client, (ThreadFunctionArgs){                                          \
-                              .function = client_function,                               \
-                              .arg = &(SubthreadArgs){.address = address,                \
-                                                      .result = &client_result}});       \
+    SubthreadArgs *client_args = malloc(sizeof(SubthreadArgs));                          \
+    *client_args = (SubthreadArgs){.address = address, .result = &client_result};        \
+    start_thread(&client,                                                                \
+                 (ThreadFunctionArgs){.function = client_function, .arg = client_args}); \
     EPCServer server;                                                                    \
     EPC_ASSERT("epc_server_bind", epc_server_bind(&server, address, 1000));
 
