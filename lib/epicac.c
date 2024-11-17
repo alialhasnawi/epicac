@@ -1791,7 +1791,6 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
                                  .buf = shared->buf + get_client_offset(connection)};
                 shared->client.message_size = 0;
 
-                // Either way, len > next_serve_index >= 0 after this.
                 if (i <= 0) {
                     // Loop back around to end of list.
                     ptr->next_serve_index = (int32_t)(connections->len & INT32_MAX) - 1;

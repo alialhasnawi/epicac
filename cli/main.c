@@ -251,7 +251,7 @@ static inline void parse_args(int argc, char *argv[], EpicatArgs *args) {
     *args = (EpicatArgs){.listen = false,
                          .buffer_size = DEFAULT_BUFFER_SIZE,
                          .message_size = DEFAULT_MESSAGE_SIZE,
-                         .loop_time = 50,
+                         .loop_time = 200,
                          .address = NULL,
                          .verbose = false,
                          .print_version = false,
@@ -552,6 +552,47 @@ static const uint32_t DEFAULT_TIMEOUT_MS = 10;
 //      ██ ██      ██   ██  ██  ██  ██      ██   ██
 // ███████ ███████ ██   ██   ████   ███████ ██   ██
 
+static int epicat_server(EpicatArgs args) {
+    EPCServer server;
+    check_error(epc_server_bind(&server, args.address, 1000));
+
+    EPCError err;
+
+    int should_flush = -1;
+
+    while (true) {
+        // Handle receiving data.
+        EPCClientID id;
+        EPCMessage message = {.buf = NULL};
+        err = epc_server_try_recv_or_accept(server, &id, &message, args.message_size,
+                                            args.loop_time);
+        check_error_allow_timeout(err);
+        if (err.low == EPC_ERR_L_GOT_MESSAGE) {
+            char *message_ = (char *)message.buf;
+            if (fwrite(message_, sizeof(char), message.len, stderr) != message.len) {
+                CLIB_ERROR("fwrite", ferror(stdout));
+            }
+            message_[message.len - 1] = '\0';
+            should_flush = 5;
+            check_error(epc_server_end_recv(server, id));
+        }
+
+        // Flush stdout buffer for better interactivity.
+        if (should_flush == 0) {
+            if (fflush(stdout)) {
+                CLIB_ERROR("fflush", ferror(stdout));
+            }
+        }
+        if (should_flush > -1) {
+            should_flush--;
+        }
+    }
+
+    check_error(epc_server_close(&server));
+
+    return 0;
+}
+
 //  ██████ ██      ██ ███████ ███    ██ ████████
 // ██      ██      ██ ██      ████   ██    ██
 // ██      ██      ██ █████   ██ ██  ██    ██
@@ -565,10 +606,11 @@ static const uint32_t DEFAULT_TIMEOUT_MS = 10;
 static_assert(sizeof(char) == 1,
               "strange architectures will not be supported unless needed");
 
-int stdin_buf_i = 0;
-int stdin_buf_len = 0;
-int stdin_buf_capacity = 0;
-char *stdin_buf;
+volatile int stdin_buf_i = 0;
+volatile int stdin_buf_len = 0;
+volatile int stdin_buf_capacity = 0;
+volatile bool stdin_open = false;
+char *volatile stdin_buf;
 
 uint32_t loop_time = 0;
 
@@ -576,16 +618,17 @@ static inline int min_i(int a, int b) { return a < b ? a : b; }
 
 static void epicat_client_stdin(void *ignore) {
     (void)ignore;
-    int end, read_len;
+    int end;
+    unsigned int read_len;
 
     // Read from stdin forever.
     // Simplifies dealing with cross platform non-blocking I/O.
-    while (stdin_buf_capacity != 0) {
+    while (stdin_open) {
         lock_mutex();
         if (stdin_buf_len == stdin_buf_capacity) {
             end = -1;
         } else {
-            int end = (stdin_buf_i + stdin_buf_len) % stdin_buf_capacity;
+            end = (stdin_buf_i + stdin_buf_len) % stdin_buf_capacity;
             if (end >= stdin_buf_i) {
                 read_len = stdin_buf_capacity - end;
             } else {
@@ -599,25 +642,34 @@ static void epicat_client_stdin(void *ignore) {
             continue;
         }
 
-        size_t read_bytes = fread(&stdin_buf[end], sizeof(char), read_len, stdin);
+        size_t read = fread(&stdin_buf[end], sizeof(char), read_len, stdin);
+
         lock_mutex();
-        stdin_buf_len += read_bytes;
-        stdin_buf_i = (stdin_buf_i + read_bytes) % stdin_buf_capacity;
+        if (read != read_len) {
+            stdin_open = false;
+        }
+
+        stdin_buf_len += read;
         unlock_mutex();
+
+        if (!read) {
+            break;
+        }
     }
 }
 
-static int epicat_client(EpicatArgs *args) {
-    stdin_buf = malloc(args->buffer_size);
-    stdin_buf_capacity = args->buffer_size;
+static int epicat_client(EpicatArgs args) {
+    stdin_buf = malloc(args.buffer_size);
+    stdin_buf_capacity = args.buffer_size;
+    stdin_open = true;
 
     Thread stdin_thread;
-    loop_time = args->loop_time;
+    loop_time = args.loop_time;
     start_thread(&stdin_thread,
                  (ThreadFunctionArgs){.arg = NULL, .function = epicat_client_stdin});
 
     EPCClient client;
-    check_error(epc_client_connect(&client, args->address, args->message_size, 1000));
+    check_error(epc_client_connect(&client, args.address, args.message_size, 1000));
 
     EPCError err;
     size_t stdin_len_to_send = 0;
@@ -638,11 +690,14 @@ static int epicat_client(EpicatArgs *args) {
             unlock_mutex();
         }
 
-        // Then, attempt to send the data.
+        // Then, attempt to send the data if any.
         if (stdin_len_to_send != 0) {
             err = epc_client_try_send(client, &buffer, DEFAULT_TIMEOUT_MS);
             check_error_allow_timeout(err);
             if (err.low != EPC_ERR_L_TIMEOUT) {
+                memcpy((void *)buffer.buf, &stdin_buf[stdin_buf_i],
+                       sizeof(char) * stdin_len_to_send);
+
                 lock_mutex();
                 stdin_buf_len -= stdin_len_to_send;
                 stdin_buf_i = (stdin_buf_i + stdin_len_to_send) % stdin_buf_capacity;
@@ -651,6 +706,9 @@ static int epicat_client(EpicatArgs *args) {
                 check_error(epc_client_end_send(client, stdin_len_to_send));
                 stdin_len_to_send = 0;
             }
+        } else if (!stdin_open) {
+            // Or quit on EOF.
+            break;
         }
 
         // Handle receiving data.
@@ -662,8 +720,8 @@ static int epicat_client(EpicatArgs *args) {
             if (fwrite(message_, sizeof(char), message.len, stdout) != message.len) {
                 CLIB_ERROR("fwrite", ferror(stdout));
             }
+            check_error(epc_client_end_recv(client));
         }
-        check_error(epc_client_end_recv(client));
     }
 
     check_error(epc_client_disconnect(&client));
@@ -714,10 +772,16 @@ int main(int argc, char *argv[]) {
 
     init_mutex();
     int status = 0;
-    if (args.listen) {
 
+    // Do not buffer stdout, unneeded with manual flush.
+    // if (setvbuf(stdout, NULL, _IONBF, 0)) {
+    //     CLIB_ERROR("setvbuf", errno);
+    // }
+
+    if (args.listen) {
+        status = epicat_server(args);
     } else {
-        status = epicat_client(&args);
+        status = epicat_client(args);
     }
     destroy_mutex();
 

@@ -262,7 +262,7 @@ static void join_thread(const Thread thread) {
 //    ██    ██           ██    ██         ██
 //    ██    ███████ ███████    ██    ███████
 
-static uint32_t roundtrip_count = 1000000;
+static uint32_t roundtrip_count = 3000000;
 static double max_accepted_rtt_ms = 0.01;
 
 typedef struct SubthreadArgs {
