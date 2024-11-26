@@ -40,7 +40,7 @@ char err_str_buffer[1024];
 #ifdef EPC_WINDOWS
 WCHAR err_str_bufferw[sizeof(err_str_buffer) / sizeof(*err_str_buffer) / 2];
 const char *err_to_string(DWORD err) {
-    size_t buflen = sizeof(err_str_buffer) / sizeof(char);
+    int buflen = sizeof(err_str_buffer) / sizeof(char);
 
     DWORD err_str_len =
         FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
@@ -64,8 +64,7 @@ const char *err_to_string(DWORD err) {
         return "WideCharToMultiByte: UTF-8 conversion error while trying to print "
                "another error";
     }
-    unsigned int ustatus = status;
-    if (ustatus > buflen) {
+    if (status > buflen) {
         return "WideCharToMultiByte: Input buffer too small while trying to print "
                "another error";
     }
@@ -237,7 +236,7 @@ static inline void parse_arg(const ArgDefinition *arg_def, EpicatArgs *args,
             USAGE_ERROR("argument for %s/-%c '%s' is out of range\n", arg_def->name,
                         arg_def->char_, arg_value);
         }
-        *(uint32_t *)(args_base + arg_def->struct_offset) = value;
+        *(uint32_t *)(args_base + arg_def->struct_offset) = (uint32_t)value;
     } else {
         assert("arg_value passed to parse_arg cannot be for an arg that doesn't need a "
                "value" &&
@@ -262,7 +261,7 @@ static inline void parse_args(int argc, char *argv[], EpicatArgs *args) {
 
     for (int i = 1; i < argc; ++i) {
         char *arg = argv[i];
-        int arg_len = strnlen(arg, 1024);
+        int arg_len = (int)strnlen(arg, 1024);
         if (arg_len >= 1023) {
             USAGE_ERROR("argument '%s' too long\n", arg);
         } else if (arg_len == 0) {
@@ -603,6 +602,10 @@ static int epicat_server(EpicatArgs args) {
 #elif defined(EPC_POSIX)
 #endif
 
+#ifndef static_assert
+#define static_assert(ignore, args)
+#endif
+
 static_assert(sizeof(char) == 1,
               "strange architectures will not be supported unless needed");
 
@@ -649,7 +652,7 @@ static void epicat_client_stdin(void *ignore) {
             stdin_open = false;
         }
 
-        stdin_buf_len += read;
+        stdin_buf_len += (int)read;
         unlock_mutex();
 
         if (!read) {
@@ -672,8 +675,8 @@ static int epicat_client(EpicatArgs args) {
     check_error(epc_client_connect(&client, args.address, args.message_size, 1000));
 
     EPCError err;
-    size_t stdin_len_to_send = 0;
-    size_t stdin_i = 0;
+    int stdin_len_to_send = 0;
+    int stdin_i = 0;
 
     while (true) {
         EPCBuffer buffer = {.buf = NULL};
@@ -685,7 +688,7 @@ static int epicat_client(EpicatArgs args) {
             if (stdin_buf_len > 0) {
                 stdin_i = stdin_buf_i;
                 stdin_len_to_send =
-                    min(stdin_i + stdin_buf_len, stdin_buf_capacity) - stdin_i;
+                    min_i(stdin_i + stdin_buf_len, stdin_buf_capacity) - (int)stdin_i;
             }
             unlock_mutex();
         }

@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
 #define EPC_WINDOWS
+#define _CRT_SECURE_NO_WARNINGS 1
 #include <Windows.h>
 #else
 #define EPC_POSIX
@@ -22,7 +23,6 @@
 #include <unistd.h>
 #endif
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,14 +108,14 @@
 static inline char *epc_err_to_string(const char *message, EPCError err) {
     const char *high_desc = epc_error_high_description(err);
     const char *low_desc = epc_error_low_description(err);
-    char *string =
-        malloc(sizeof(char) * (strlen(message) + strlen(high_desc) + strlen(low_desc)) +
-               sizeof(":  ()"));
+    size_t string_buflen = strlen(message) + strlen(high_desc) + strlen(low_desc);
+    char *string = malloc(sizeof(char) * string_buflen + sizeof(":  ()"));
     if (string == NULL) {
         TEST_PERROR("malloc");
     }
-    if (sprintf(string, "%s: %s (%s)", message, high_desc, low_desc) < -1) {
-        TEST_PERROR("sprintf");
+    if (snprintf(string, string_buflen, "%s: %s (%s)", message, high_desc, low_desc) <
+        -1) {
+        TEST_PERROR("snprintf");
     }
     return string;
 }
@@ -535,7 +535,7 @@ static TestResult test_server_send() {
 }
 
 static void all_tests() {
-    srand(time(NULL));
+    srand((unsigned int)time(NULL));
 
     RUN_TEST(test_basic_server_start);
     RUN_TEST(test_unique_server);

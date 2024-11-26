@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
 #define EPC_WINDOWS
+#define _CRT_SECURE_NO_WARNINGS 1
 #include <Windows.h>
 #else
 #define EPC_POSIX
@@ -22,7 +23,6 @@
 #include <unistd.h>
 #endif
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +38,15 @@
 //  ██████     ██    ██ ███████ ███████
 
 // Thank you to https://jera.com/techinfo/jtns/jtn002 <3
+
+#define ASSERT(condition)                                                                \
+    do {                                                                                 \
+        if (!(condition)) {                                                              \
+            fprintf(stderr, "Assertion failed: %s\n", #condition);                       \
+            exit(2);                                                                     \
+        }                                                                                \
+                                                                                         \
+    } while (0)
 
 #define TEST_PERROR(message)                                                             \
     do {                                                                                 \
@@ -272,10 +281,10 @@ typedef struct SubthreadArgs {
 #define TEST_CLIENT_OPEN                                                                 \
     SubthreadArgs *args_ = (SubthreadArgs *)args;                                        \
     EPCClient client;                                                                    \
-    assert(                                                                              \
+    ASSERT(                                                                              \
         epc_error_ok(epc_client_connect(&client, args_->address, requested_size, 200)));
 
-#define TEST_CLIENT_CLOSE assert(epc_error_ok(epc_client_disconnect(&client)));
+#define TEST_CLIENT_CLOSE ASSERT(epc_error_ok(epc_client_disconnect(&client)));
 
 #define TEST_SERVER_OPEN_WITH_CLIENT(client_function)                                    \
     char address[ADDRESS_LENGTH + 1] = {0};                                              \
@@ -286,10 +295,10 @@ typedef struct SubthreadArgs {
                                                    .address = address,                   \
                                                }});                                      \
     EPCServer server;                                                                    \
-    assert(epc_error_ok(epc_server_bind(&server, address, 1000)));
+    ASSERT(epc_error_ok(epc_server_bind(&server, address, 1000)));
 
 #define TEST_SERVER_CLOSE_WITH_CLIENT                                                    \
-    assert(epc_error_ok(epc_server_close(&server)));                                     \
+    ASSERT(epc_error_ok(epc_server_close(&server)));                                     \
     join_thread(client);
 
 const char test_message[] =
@@ -311,29 +320,28 @@ const char test_message[] =
 static const uint32_t requested_size = sizeof(test_message);
 
 static void test_client_send_client_thread(void *args) {
-    TEST_CLIENT_OPEN
+    TEST_CLIENT_OPEN(void) client;
 
     for (uint32_t i = 0; i < roundtrip_count; ++i) {
         EPCBuffer buffer = {.buf = NULL};
-        assert(epc_error_ok(epc_client_try_send(client, &buffer, 1000)));
+        ASSERT(epc_error_ok(epc_client_try_send(client, &buffer, 1000)));
 
-        assert(buffer.buf != NULL);
-        assert(buffer.size == requested_size);
+        ASSERT(buffer.buf != NULL);
+        ASSERT(buffer.size == requested_size);
 
         buffer.buf[0] = 0;
         char *buf_ = (char *)buffer.buf;
         strcat(buf_, test_message);
 
-        assert(epc_error_ok(epc_client_end_send(client, sizeof(test_message))));
+        ASSERT(epc_error_ok(epc_client_end_send(client, sizeof(test_message))));
 
         EPCMessage message = {.buf = NULL};
-        assert(epc_error_ok(epc_client_try_recv(client, &message, 1000)));
-        assert(message.len == sizeof(test_message));
+        ASSERT(epc_error_ok(epc_client_try_recv(client, &message, 1000)));
+        ASSERT(message.len == sizeof(test_message));
         char *message_ = (char *)message.buf;
-        assert(message_ != NULL);
-        // assert(!memcmp(message_, test_message, message.len));
-        EPCError e = epc_client_end_recv(client);
-        assert(epc_error_ok(e));
+        ASSERT(message_ != NULL);
+        // ASSERT(!memcmp(message_, test_message, message.len));
+        ASSERT(epc_error_ok(epc_client_end_recv(client)));
     }
 
     TEST_CLIENT_CLOSE
@@ -343,34 +351,35 @@ static void test_client_send() {
     TEST_SERVER_OPEN_WITH_CLIENT(test_client_send_client_thread)
 
     EPCClientID client_id;
+    (void)client_id;
     EPCMessage message = {.buf = NULL};
-    assert(err_eq(
+    ASSERT(err_eq(
         epc_server_try_recv_or_accept(server, &client_id, &message, requested_size, 1000),
         error(OK, ACCEPTED)));
 
     for (uint32_t i = 0; i < roundtrip_count; ++i) {
         message = (EPCMessage){.buf = NULL};
-        assert(err_eq(epc_server_try_recv_or_accept(server, &client_id, &message,
+        ASSERT(err_eq(epc_server_try_recv_or_accept(server, &client_id, &message,
                                                     requested_size, 1000),
                       error(OK, GOT_MESSAGE)));
-        assert(message.len == sizeof(test_message));
+        ASSERT(message.len == sizeof(test_message));
         char *message_ = (char *)message.buf;
-        assert(message_ != NULL);
-        // assert(!memcmp(message_, test_message, message.len));
+        ASSERT(message_ != NULL);
+        // ASSERT(!memcmp(message_, test_message, message.len));
 
-        assert(epc_error_ok(epc_server_end_recv(server, client_id)));
+        ASSERT(epc_error_ok(epc_server_end_recv(server, client_id)));
 
         EPCBuffer buffer = {.buf = NULL};
-        assert(epc_error_ok(epc_server_try_send(server, client_id, &buffer, 1000)));
+        ASSERT(epc_error_ok(epc_server_try_send(server, client_id, &buffer, 1000)));
 
-        assert(buffer.buf != NULL);
-        assert(buffer.size == requested_size);
+        ASSERT(buffer.buf != NULL);
+        ASSERT(buffer.size == requested_size);
 
         buffer.buf[0] = 0;
         char *buf_ = (char *)buffer.buf;
         strcat(buf_, test_message);
 
-        assert(
+        ASSERT(
             epc_error_ok(epc_server_end_send(server, client_id, sizeof(test_message))));
     }
 
@@ -382,7 +391,7 @@ int main(int argc, char **argv) {
     (void)argv;
 
     init_mutex();
-    srand(time(NULL));
+    srand((unsigned int)time(NULL));
     (void)unlock_mutex;
     (void)lock_mutex;
     (void)sleep_ms;

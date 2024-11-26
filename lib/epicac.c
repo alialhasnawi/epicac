@@ -323,17 +323,18 @@ static EPCError build_internal_obj_name(BuildNameParams *params, String *string,
     char b64_scratch[EPC_FIXED_ID_LEN];
 
     size_t start = 0;
-    start += cat(buf, start, EPC_PREFIX_LEN, epc_prefix);
-    start += cat(buf, start, EPC_OBJECT_TYPE_LEN, (const char *)params->object_type_str);
+    start += cat(buf, (uint16_t)start, EPC_PREFIX_LEN, epc_prefix);
+    start += cat(buf, (uint16_t)start, EPC_OBJECT_TYPE_LEN,
+                 (const char *)params->object_type_str);
     base64_encode(params->fixed_id, b64_scratch);
-    start += cat(buf, start, EPC_FIXED_ID_LEN, b64_scratch);
+    start += cat(buf, (uint16_t)start, EPC_FIXED_ID_LEN, b64_scratch);
     base64_encode(params->dynamic_id, b64_scratch);
-    start += cat(buf, start, EPC_FIXED_ID_LEN, b64_scratch);
-    start += cat(buf, start, params->name.len, params->name.bytes);
-    start += cat(buf, start, 1, "\0");
+    start += cat(buf, (uint16_t)start, EPC_FIXED_ID_LEN, b64_scratch);
+    start += cat(buf, (uint16_t)start, params->name.len, params->name.bytes);
+    start += cat(buf, (uint16_t)start, 1, "\0");
 
     string->bytes = buf;
-    string->len = start;
+    string->len = (uint16_t)start;
 
     return EPC_OK;
 }
@@ -350,7 +351,7 @@ static thread_local WCHAR wide_char_scratch[EPC_MAX_SHMEM_NAME * 2 + 1];
 static EPCError utf8_to_wide_char_scratch(const char *name, size_t len, WCHAR buf[],
                                           size_t bufsize) {
 
-    int status = MultiByteToWideChar(CP_UTF8, 0, name, len, NULL, 0);
+    int status = MultiByteToWideChar(CP_UTF8, 0, name, (int)len, NULL, 0);
     if ((status <= 0)) {
         // Error occured.
         return error(ARGS, STRING_UTF8_INVALID);
@@ -361,7 +362,7 @@ static EPCError utf8_to_wide_char_scratch(const char *name, size_t len, WCHAR bu
         return error(ARGS, STRING_TOO_LONG);
     }
 
-    status = MultiByteToWideChar(CP_UTF8, 0, name, len, buf, bufsize);
+    status = MultiByteToWideChar(CP_UTF8, 0, name, (int)len, buf, (int)bufsize);
     if (status <= 0) {
         return error(ARGS, STRING_UTF8_INVALID);
     }
@@ -386,6 +387,8 @@ static uint64_t get_page_size() {
         page_size = sys_info.dwPageSize;
 #elif defined(EPC_POSIX)
         page_size = sysconf(_SC_PAGESIZE);
+        if (page_size == -1)
+            page_size = 1024;
 #endif
         assert("Page size fits in 32 bits" && page_size <= UINT32_MAX);
     }
@@ -913,11 +916,12 @@ static inline uint8_t find_first_set_index(uint8_t value) {
     assert("ffs does not support zero" && value != 0);
 
 #if defined(_MSC_VER)
-    unsigned long index;
-    unsigned long mask = value;
-    assert("MSVC builtin cannot fail on non-zero mask" && _BitScanForward(&index, mask));
+    DWORD index = 0;
+    DWORD mask = value;
+    BOOLEAN ok = _BitScanForward(&index, mask);
+    assert("MSVC builtin cannot fail on non-zero mask" && ok);
     assert(0 <= index && index <= 7);
-    return index;
+    return (uint8_t)index;
 #elif defined(__GNUC__) || defined(__clang__)
     int mask = value;
     int index = __builtin_ffs(mask);
@@ -956,7 +960,7 @@ static EPCError BitArray_get_new_bit(BitArray *array, uint32_t *index) {
         if ((err = Array_U8_append(&array->array, 0x01)).high)
             return err;
 
-        byte_index = array->array.len - 1;
+        byte_index = (uint32_t)array->array.len - 1;
         bit_index = 1;
     }
 
@@ -1091,7 +1095,7 @@ static bool update_timeout(uint64_t *last_time, uint32_t *timeout_ms) {
         *timeout_ms = 0;
         return true;
     } else { // elapsed < *timeout_ms
-        *timeout_ms -= elapsed;
+        *timeout_ms -= (uint32_t)elapsed;
     }
 
     return false;
@@ -1256,7 +1260,7 @@ EPCError epc_server_bind(EPCServer *server, const char *name, uint32_t timeout_m
 #define CLEANUP cleanup_server_alloced
 
     // Initialize internal name storage.
-    ptr->name_len = name_len;
+    ptr->name_len = (uint16_t)name_len;
     memcpy(ptr->name, name, name_len);
     ptr->name[name_len] = '\0';
 
@@ -1487,7 +1491,8 @@ static EPCError epc_server_accept(Server *ptr, EPCClientID *client_id,
 #undef CLEANUP
 #define CLEANUP cleanup_id_alloced
 
-    connection.server_buf_size = requested_size ? requested_size : get_page_size();
+    connection.server_buf_size =
+        requested_size ? requested_size : (uint32_t)get_page_size();
     connection.client_buf_size = join_area->client_size;
     connection.last_response_time_ms = monotonic_time_ms();
 
@@ -1680,7 +1685,7 @@ EPCError epc_server_close(EPCServer *server) {
     Array_ClientConnection *clients = &ptr->clients;
     for (int64_t i = clients->len - 1; i >= 0; --i) {
         // This should never fail.
-        epc_server_disconnect_client(ptr, i, TURN_CLOSE);
+        epc_server_disconnect_client(ptr, (uint32_t)i, TURN_CLOSE);
     }
 
     // Close system resources.
@@ -1809,7 +1814,7 @@ EPCError epc_server_try_recv_or_accept(EPCServer server,
                 return error(OK, GOT_MESSAGE);
             }
         }
-        ptr->next_serve_index = connections->len - 1;
+        ptr->next_serve_index = (int32_t)connections->len - 1;
 
         if (!last_time) {
             last_time = monotonic_time_ms();
@@ -1991,7 +1996,7 @@ EPCError epc_client_connect(EPCClient *client, const char *name, uint32_t reques
 #define CLEANUP cleanup_alloc
 
     // Initialize internal name storage.
-    ptr->name_len = name_len;
+    ptr->name_len = (uint16_t)name_len;
     memcpy(ptr->name, name, name_len);
     ptr->name[name_len] = '\0';
     String name_str = (String){.len = ptr->name_len, .bytes = ptr->name};
@@ -2078,7 +2083,7 @@ EPCError epc_client_connect(EPCClient *client, const char *name, uint32_t reques
     // Request an ID.
     join_area->abort = false;
     join_area->client_header = EPC_HEADER;
-    join_area->client_size = requested_size ? requested_size : get_page_size();
+    join_area->client_size = requested_size ? requested_size : (uint32_t)get_page_size();
     join_area->server_ready = false;
     MEMORY_BARRIER;
     join_area->client_waiting = true;
